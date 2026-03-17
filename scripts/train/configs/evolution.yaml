@@ -1,0 +1,75 @@
+# Evolution head training configuration
+#
+# Usage:
+#   python scripts/train/train_evolution.py scripts/train/configs/evolution.yaml
+#
+# Override any value from the command line:
+#   python scripts/train/train_evolution.py scripts/train/configs/evolution.yaml \
+#       training.lr=5e-4 training.bt_temperature=0.5 debug=true
+
+# ----- Data -----
+cache_dir: SET_PATH_HERE                  # Directory containing cached .pt files from cache_evolution_features.py
+train_pairs_csv: SET_PATH_HERE            # CSV with columns: preferred,dispreferred,dist_preferred,dist_dispreferred
+val_pairs_csv: null                       # Optional validation pairs CSV (same format)
+
+# ----- Output -----
+output: SET_PATH_HERE                     # Output directory for checkpoints and logs
+pretrained: null                          # Optional: path to a pretrained evolution checkpoint to resume from
+resume: null                              # Optional: path to a Lightning checkpoint to resume training
+
+# ----- Evolution module architecture -----
+# These should match the Boltz2 trunk dimensions (token_s=384, token_z=128)
+evolution_model_args:
+  token_s: 384
+  token_z: 128
+  pairformer_args:
+    num_blocks: 4                         # Small pairformer for the evolution head
+    dropout: 0.25
+    pairwise_head_width: 32
+    pairwise_num_heads: 4
+    activation_checkpointing: false
+  head_hidden_dim: 384                    # Hidden dim for the prediction MLP
+  num_dist_bins: 64
+  max_dist: 22
+  use_interface_mask: false               # false = all pairs, true = interface-only (like affinity)
+
+# ----- Training hyperparameters -----
+training:
+  lr: 1.8e-3
+  adam_beta_1: 0.9
+  adam_beta_2: 0.95
+  adam_eps: 1.0e-8
+  weight_decay: 0.0
+
+  # Loss weights
+  bt_weight: 1.0                          # Weight for Bradley-Terry loss
+  margin_weight: 0.5                      # Weight for margin ranking loss (set 0 to disable)
+  bt_temperature: 1.0                     # Temperature for BT comparison
+  margin_alpha: 1.0                       # Margin scaling factor for distance gaps
+
+  # LR schedule: null, "cosine", or "linear_warmup_cosine"
+  lr_scheduler: linear_warmup_cosine
+  lr_warmup_steps: 1000
+  lr_cosine_T_max: 50000
+  lr_min: 1.0e-6
+
+# ----- Trainer (PyTorch Lightning) -----
+trainer:
+  accelerator: gpu
+  devices: 1
+  precision: 32
+  gradient_clip_val: 10.0
+  max_epochs: 100
+  accumulate_grad_batches: 16             # Effective batch size = 16 pairs
+  check_val_every_n_epoch: 1
+
+# ----- Misc -----
+num_workers: 4
+save_top_k: 3
+debug: false                              # Debug mode: single device, no wandb, num_workers=0
+
+# ----- Optional wandb logging -----
+# wandb:
+#   name: evolution-head
+#   project: boltz-evolution
+#   entity: your-entity

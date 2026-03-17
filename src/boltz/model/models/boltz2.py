@@ -514,6 +514,7 @@ class Boltz2(LightningModule):
                 "pdistogram": pdistogram,
                 "s": s,
                 "z": z,
+                "s_inputs": s_inputs,
             }
 
             if (
@@ -1115,6 +1116,7 @@ class Boltz2(LightningModule):
             pred_dict["token_masks"] = batch["token_pad_mask"]
             pred_dict["s"] = out["s"]
             pred_dict["z"] = out["z"]
+            pred_dict["s_inputs"] = out["s_inputs"]
 
             if "keys_dict_out" in self.predict_args:
                 for key in self.predict_args["keys_dict_out"]:
