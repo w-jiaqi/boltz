@@ -7,7 +7,7 @@ from boltz.model.modules.encodersv2 import PairwiseConditioning
 from boltz.model.modules.utils import LinearNoBias
 
 
-class EvoLandscapeModule(nn.Module):
+class EvolutionModule(nn.Module):
     """Evolutionary landscape prediction head.
 
     Architecturally mirrors AffinityModule: takes detached trunk outputs
@@ -76,7 +76,7 @@ class EvoLandscapeModule(nn.Module):
         )
 
         self.pairformer_stack = PairformerNoSeqModule(token_z, **pairformer_args)
-        self.evo_heads = EvoLandscapeHeads(
+        self.evolution_heads = EvolutionHeads(
             token_z=token_z,
             hidden_dim=head_hidden_dim,
         )
@@ -179,7 +179,7 @@ class EvoLandscapeModule(nn.Module):
         )
 
         # --- Step 7: Predict evolutionary energy ---
-        out_dict = self.evo_heads(
+        out_dict = self.evolution_heads(
             z=z,
             feats=feats,
             multiplicity=multiplicity,
@@ -189,7 +189,7 @@ class EvoLandscapeModule(nn.Module):
         return out_dict
 
 
-class EvoLandscapeHeads(nn.Module):
+class EvolutionHeads(nn.Module):
     """Prediction head: pool refined pair representation → MLP → scalar energy.
 
     Pools the refined pair representation z into a global vector via

@@ -20,7 +20,7 @@ from boltz.model.loss.confidencev2 import (
 )
 from boltz.model.loss.distogramv2 import distogram_loss
 from boltz.model.modules.affinity import AffinityModule
-from boltz.model.modules.evo_landscape import EvoLandscapeModule
+from boltz.model.modules.evolution import EvolutionModule
 from boltz.model.modules.confidencev2 import ConfidenceModule
 from boltz.model.modules.diffusion_conditioning import DiffusionConditioning
 from boltz.model.modules.diffusionv2 import AtomDiffusion
@@ -60,7 +60,7 @@ class Boltz2(LightningModule):
         affinity_model_args: Optional[dict[str, Any]] = None,
         affinity_model_args1: Optional[dict[str, Any]] = None,
         affinity_model_args2: Optional[dict[str, Any]] = None,
-        evo_landscape_model_args: Optional[dict[str, Any]] = None,
+        evolution_model_args: Optional[dict[str, Any]] = None,
         validators: Any = None,
         num_val_datasets: int = 1,
         atom_feature_dim: int = 128,
@@ -69,7 +69,7 @@ class Boltz2(LightningModule):
         affinity_prediction: bool = False,
         affinity_ensemble: bool = False,
         affinity_mw_correction: bool = True,
-        evo_landscape_prediction: bool = False,
+        evolution_prediction: bool = False,
         run_trunk_and_structure: bool = True,
         skip_run_structure: bool = False,
         token_level_confidence: bool = True,
@@ -82,7 +82,7 @@ class Boltz2(LightningModule):
         compile_structure: bool = False,
         compile_confidence: bool = False,
         compile_affinity: bool = False,
-        compile_evo_landscape: bool = False,
+        compile_evolution: bool = False,
         compile_msa: bool = False,
         exclude_ions_from_lddt: bool = False,
         ema: bool = False,
@@ -299,7 +299,7 @@ class Boltz2(LightningModule):
         self.affinity_prediction = affinity_prediction
         self.affinity_ensemble = affinity_ensemble
         self.affinity_mw_correction = affinity_mw_correction
-        self.evo_landscape_prediction = evo_landscape_prediction
+        self.evolution_prediction = evolution_prediction
         self.run_trunk_and_structure = run_trunk_and_structure
         self.skip_run_structure = skip_run_structure
         self.token_level_confidence = token_level_confidence
@@ -353,15 +353,15 @@ class Boltz2(LightningModule):
                         self.affinity_module, dynamic=False, fullgraph=False
                     )
 
-        if self.evo_landscape_prediction:
-            self.evo_landscape_module = EvoLandscapeModule(
+        if self.evolution_prediction:
+            self.evolution_module = EvolutionModule(
                 token_s,
                 token_z,
-                **evo_landscape_model_args,
+                **evolution_model_args,
             )
-            if compile_evo_landscape:
-                self.evo_landscape_module = torch.compile(
-                    self.evo_landscape_module, dynamic=False, fullgraph=False
+            if compile_evolution:
+                self.evolution_module = torch.compile(
+                    self.evolution_module, dynamic=False, fullgraph=False
                 )
 
         # Remove grad from weights they are not trained for ddp
@@ -372,7 +372,7 @@ class Boltz2(LightningModule):
                     not in [
                         "confidence_module",
                         "affinity_module",
-                        "evo_landscape_module",
+                        "evolution_module",
                     ]
                     and "out_token_feat_update" not in name
                 ):
@@ -743,7 +743,7 @@ class Boltz2(LightningModule):
                         }
                     )
 
-        if self.evo_landscape_prediction:
+        if self.evolution_prediction:
             argsort_evo = torch.argsort(dict_out["iptm"], descending=True)
             best_idx_evo = argsort_evo[0].item()
             coords_evo = dict_out["sample_atom_coords"].detach()[best_idx_evo][
@@ -751,7 +751,7 @@ class Boltz2(LightningModule):
             ]
 
             with torch.autocast("cuda", enabled=False):
-                dict_out_evo = self.evo_landscape_module(
+                dict_out_evo = self.evolution_module(
                     s_inputs=s_inputs_trunk.detach(),
                     z=z.detach(),
                     x_pred=coords_evo,
@@ -1160,7 +1160,7 @@ class Boltz2(LightningModule):
                     pred_dict["affinity_probability_binary2"] = out[
                         "affinity_probability_binary2"
                     ]
-            if self.evo_landscape_prediction:
+            if self.evolution_prediction:
                 pred_dict["evo_energy"] = out["evo_energy"]
             return pred_dict
 

@@ -1,4 +1,4 @@
-"""Loss functions for evolutionary landscape head training.
+"""Loss functions for evolution head training.
 
 These losses learn a scalar energy E(A, B) from RELATIVE supervision only
 (no absolute ground-truth labels). Low energy = evolutionarily compatible,
@@ -33,7 +33,7 @@ loop must provide paired data. Two practical approaches:
 
 (B) Cached representations:
     Pre-compute (z, s_inputs, x_pred, feats) for all complexes with
-    the frozen trunk, cache to disk, then train the evo landscape head
+    the frozen trunk, cache to disk, then train the evolution head
     cheaply on cached features with paired sampling.
 
 Gauge trick
@@ -168,7 +168,7 @@ def listwise_kl_loss(
     return F.kl_div(log_p, q, reduction="sum")
 
 
-def evo_landscape_loss(
+def evolution_loss(
     energies_preferred: Tensor,
     energies_dispreferred: Tensor,
     distances_preferred: Tensor = None,
@@ -178,7 +178,7 @@ def evo_landscape_loss(
     bt_temperature: float = 1.0,
     margin_alpha: float = 1.0,
 ) -> dict:
-    """Combined evolutionary landscape loss.
+    """Combined evolution loss.
 
     Convenience wrapper that computes a weighted sum of Bradley-Terry
     and margin ranking losses.
