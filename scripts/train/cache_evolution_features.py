@@ -44,11 +44,12 @@ FEAT_KEYS = ["token_pad_mask", "token_to_rep_atom", "mol_type", "affinity_token_
 class EvolutionCacheWriter(BasePredictionWriter):
     """Saves trunk representations to .pt files during prediction."""
 
-    def __init__(self, output_dir: str, save_half: bool = True):
+    def __init__(self, output_dir: str, save_half: bool = True, skip_diffusion: bool = False):
         super().__init__(write_interval="batch")
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.save_half = save_half
+        self.skip_diffusion = skip_diffusion
 
     def write_on_batch_end(
         self, trainer, pl_module, prediction, batch_indices, batch, batch_idx, dataloader_idx
@@ -61,13 +62,26 @@ class EvolutionCacheWriter(BasePredictionWriter):
 
         maybe_half = lambda t: t.half() if self.save_half else t  # noqa: E731
 
-        best_idx = 0
-        if "iptm" in prediction and prediction["iptm"] is not None:
-            best_idx = torch.argsort(prediction["iptm"], descending=True)[0].item()
+        if self.skip_diffusion:
+            # Use ground truth coords from the batch as x_pred
+            # coords shape: [B, K, N_atoms, 3] — take first conformer
+            gt_coords = batch["coords"]
+            if gt_coords.dim() == 4:
+                x_pred = gt_coords[0, 0]
+            elif gt_coords.dim() == 3:
+                x_pred = gt_coords[0]
+            else:
+                x_pred = gt_coords
+        else:
+            # Use best predicted coords (selected by iPTM)
+            best_idx = 0
+            if "iptm" in prediction and prediction["iptm"] is not None:
+                best_idx = torch.argsort(prediction["iptm"], descending=True)[0].item()
+            coords = prediction["coords"]
+            x_pred = coords[best_idx] if coords.dim() == 3 else coords
 
-        coords = prediction["coords"]
-        x_pred = coords[best_idx] if coords.dim() == 3 else coords
-
+        # Reconstruct s_inputs via input embedder (cheap, avoids needing
+        # s_inputs in predict_step output for compatibility with original boltz)
         with torch.no_grad():
             device = next(pl_module.parameters()).device
             batch_device = {
@@ -110,6 +124,9 @@ def main():
     parser.add_argument("--no_half", action="store_true", help="Save in float32")
     parser.add_argument("--use_msa_server", action="store_true")
     parser.add_argument("--no_kernels", action="store_true")
+    parser.add_argument("--skip_diffusion", action="store_true",
+                        help="Skip diffusion sampling and use ground truth coords as x_pred. "
+                        "Much faster (~2x) when you have experimental structures.")
     args = parser.parse_args()
 
     data_path = Path(args.data)
@@ -188,8 +205,7 @@ def main():
         "write_full_pde": False,
     }
 
-    model = Boltz2.load_from_checkpoint(
-        str(checkpoint),
+    load_kwargs = dict(
         strict=True,
         predict_args=predict_args,
         map_location="cpu",
@@ -200,6 +216,14 @@ def main():
         msa_args=asdict(msa_args),
         steering_args=asdict(steering_args),
     )
+
+    if args.skip_diffusion:
+        # Tell the model to run trunk but skip structure prediction.
+        # The model still produces s, z, s_inputs and the predict_step
+        # still returns them. Diffusion sampling is skipped entirely.
+        load_kwargs["skip_run_structure"] = True
+
+    model = Boltz2.load_from_checkpoint(str(checkpoint), **load_kwargs)
     model.eval()
 
     # ---- Step 3: Create data module (same as boltz predict lines 1271-1282) ----
@@ -218,6 +242,7 @@ def main():
     cache_writer = EvolutionCacheWriter(
         output_dir=str(out_dir),
         save_half=not args.no_half,
+        skip_diffusion=args.skip_diffusion,
     )
 
     trainer = pl.Trainer(
