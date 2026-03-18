@@ -61,11 +61,7 @@ from pytorch_lightning.callbacks import BasePredictionWriter
 
 # Boltz imports — these are available after `pip install -e .`
 from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
-from boltz.main import (
-    BoltzProcessedInput,
-    check_inputs,
-    process_inputs,
-)
+from boltz.main import check_inputs, process_inputs
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +196,10 @@ def main():
     parser.add_argument("--accelerator", default="gpu")
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--no_half", action="store_true", help="Save in float32")
+    parser.add_argument("--use_msa_server", action="store_true",
+                        help="Use MMseqs2 server for MSA generation")
+    parser.add_argument("--no_kernels", action="store_true",
+                        help="Disable custom CUDA kernels (use pure PyTorch)")
     args = parser.parse_args()
 
     data_path = Path(args.data)
@@ -220,32 +220,30 @@ def main():
         sys.exit(1)
     ccd = load_canonicals(mol_dir)
 
-    # Discover input files
-    input_paths = sorted(
-        list(data_path.glob("*.yaml"))
-        + list(data_path.glob("*.yml"))
-        + list(data_path.glob("*.fasta"))
-        + list(data_path.glob("*.fa"))
-    )
+    # Discover and validate input files
+    input_paths = check_inputs(data_path)
     if not input_paths:
         print(f"ERROR: No YAML/FASTA files found in {data_path}")
         sys.exit(1)
     print(f"Found {len(input_paths)} input files")
 
-    # Process inputs
+    # Process inputs (tokenize, compute MSA, etc.)
     processing_dir = out_dir / "_processing"
-    manifest = check_inputs(input_paths, processing_dir, ccd)
-    processed = process_inputs(
+    ccd_path = cache / "ccd.pkl"
+    manifest = process_inputs(
         data=input_paths,
         out_dir=processing_dir,
-        cache=cache,
-        ccd=ccd,
-        use_msa_server=False,
-        msa_server_url="",
-        msa_paired_server_url="",
+        ccd_path=ccd_path,
+        mol_dir=mol_dir,
+        use_msa_server=args.use_msa_server,
+        msa_server_url="https://api.colabfold.com",
+        msa_pairing_strategy="greedy",
         max_msa_seqs=4096,
-        override=True,
+        boltz2=True,
     )
+    # Build a processed-input-like object for the data module
+    processed_targets = processing_dir / "processed" / "targets"
+    processed_msa = processing_dir / "processed" / "msa"
 
     # Load model
     predict_args = {
@@ -272,14 +270,15 @@ def main():
         msa_args=asdict(msa_params),
         steering_args=asdict(steering_params),
         ema=False,
+        use_kernels=not args.no_kernels,
     )
     model.eval()
 
     # Create data module
     data_module = Boltz2InferenceDataModule(
-        manifest=processed.manifest,
-        target_dir=processed.targets_dir,
-        msa_dir=processed.msa_dir,
+        manifest=manifest,
+        target_dir=processed_targets,
+        msa_dir=processed_msa,
         mol_dir=mol_dir,
         num_workers=args.num_workers,
     )
