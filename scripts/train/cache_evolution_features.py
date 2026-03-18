@@ -1,56 +1,22 @@
 """Cache trunk representations for evolution head training.
 
-Runs Boltz2 inference on a set of input structures and saves the
-intermediate representations needed by the EvolutionModule:
-  - s_inputs  (input embedder output)
-  - z         (pairformer pair representation)
-  - x_pred    (best predicted atom coordinates, selected by iPTM)
-  - feats     (token_pad_mask, token_to_rep_atom, mol_type, affinity_token_mask)
-
-These cached .pt files are then used by train_evolution.py.
-
-Prerequisites:
-    - A Boltz2 checkpoint (structure + confidence)
-    - Input structures in boltz predict format (YAML/FASTA files)
-    - The boltz package installed (`pip install -e .`)
+Runs Boltz2 inference on input structures and saves the intermediate
+representations needed by the EvolutionModule. Uses the EXACT same
+model loading path as `boltz predict` to avoid version mismatches.
 
 Usage:
-    python scripts/train/cache_evolution_features.py \\
-        --data /path/to/structures/ \\
-        --output /path/to/cache/ \\
-        --checkpoint /path/to/boltz2.ckpt \\
-        --recycling_steps 3 \\
-        --sampling_steps 200 \\
-        --diffusion_samples 5
-
-    The --data directory should contain YAML or FASTA files in the same
-    format accepted by `boltz predict`.
-
-    Each input structure will produce a file {complex_id}.pt in the
-    output directory.
-
-Alternative (manual caching):
-    If you already have Boltz2 predictions and want to cache from them,
-    you can write a simple script:
-
-        model = Boltz2.load_from_checkpoint(...)
-        model.eval()
-        for batch in dataloader:
-            with torch.no_grad():
-                out = model(batch, recycling_steps=3, ...)
-            torch.save({
-                "s_inputs": out["s_inputs"][0].cpu().half(),
-                "z": out["z"][0].cpu().half(),
-                "x_pred": out["sample_atom_coords"][best_idx].cpu().half(),
-                "token_pad_mask": batch["token_pad_mask"][0].cpu(),
-                "token_to_rep_atom": batch["token_to_rep_atom"][0].cpu().half(),
-                "mol_type": batch["mol_type"][0].cpu(),
-                "affinity_token_mask": batch["affinity_token_mask"][0].cpu(),
-            }, f"cache/{record_id}.pt")
+    python scripts/train/cache_evolution_features.py \
+        --data /path/to/structures/ \
+        --output /path/to/cache/ \
+        --checkpoint /path/to/boltz2_conf.ckpt \
+        --cache /path/to/boltz_cache \
+        --use_msa_server \
+        --no_kernels
 """
 
 import argparse
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
@@ -58,20 +24,23 @@ import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import BasePredictionWriter
 
-# Boltz imports — these are available after `pip install -e .`
 from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
-from boltz.main import check_inputs, process_inputs
+from boltz.main import (
+    Boltz2DiffusionParams,
+    BoltzSteeringParams,
+    MSAModuleArgs,
+    PairformerArgsV2,
+    check_inputs,
+    process_inputs,
+)
+from boltz.model.models.boltz2 import Boltz2
 
-
-# ---------------------------------------------------------------------------
-# Prediction writer that saves cached features
-# ---------------------------------------------------------------------------
 
 FEAT_KEYS = ["token_pad_mask", "token_to_rep_atom", "mol_type", "affinity_token_mask"]
 
 
 class EvolutionCacheWriter(BasePredictionWriter):
-    """Saves trunk representations to .pt files during Boltz2 prediction."""
+    """Saves trunk representations to .pt files during prediction."""
 
     def __init__(self, output_dir: str, save_half: bool = True):
         super().__init__(write_interval="batch")
@@ -95,13 +64,20 @@ class EvolutionCacheWriter(BasePredictionWriter):
             best_idx = torch.argsort(prediction["iptm"], descending=True)[0].item()
 
         coords = prediction["coords"]
-        if coords.dim() == 3:
-            x_pred = coords[best_idx]
-        else:
-            x_pred = coords
+        x_pred = coords[best_idx] if coords.dim() == 3 else coords
+
+        # Reconstruct s_inputs by running the input embedder on the batch
+        # (cheap operation, avoids needing s_inputs in predict_step output)
+        with torch.no_grad():
+            device = next(pl_module.parameters()).device
+            batch_device = {
+                k: v.to(device) if torch.is_tensor(v) else v
+                for k, v in batch.items()
+            }
+            s_inputs = pl_module.input_embedder(batch_device)
 
         cache = {
-            "s_inputs": maybe_half(prediction["s_inputs"][0].cpu()),
+            "s_inputs": maybe_half(s_inputs[0].cpu()),
             "z": maybe_half(prediction["z"][0].cpu()),
             "x_pred": maybe_half(x_pred.cpu()),
         }
@@ -114,31 +90,17 @@ class EvolutionCacheWriter(BasePredictionWriter):
                 cache[key] = val
 
         torch.save(cache, out_path)
-        print(f"  Cached {record_id} → {out_path}")
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
+        print(f"  Cached {record_id} -> {out_path}")
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Cache Boltz2 trunk representations for evolution head training."
     )
-    parser.add_argument(
-        "--data", required=True, help="Path to input structures (YAML/FASTA directory)"
-    )
-    parser.add_argument(
-        "--output", required=True, help="Output directory for cached .pt files"
-    )
-    parser.add_argument(
-        "--checkpoint", required=True, help="Path to Boltz2 checkpoint (.ckpt)"
-    )
-    parser.add_argument(
-        "--cache", default="~/.boltz",
-        help="Boltz cache directory for CCD dict etc.",
-    )
+    parser.add_argument("--data", required=True, help="Input structures (YAML/FASTA dir or file)")
+    parser.add_argument("--output", required=True, help="Output directory for cached .pt files")
+    parser.add_argument("--checkpoint", required=True, help="Path to boltz2_conf.ckpt")
+    parser.add_argument("--cache", default="~/.boltz", help="Boltz cache directory (CCD/mols)")
     parser.add_argument("--recycling_steps", type=int, default=3)
     parser.add_argument("--sampling_steps", type=int, default=200)
     parser.add_argument("--diffusion_samples", type=int, default=5)
@@ -146,10 +108,8 @@ def main():
     parser.add_argument("--accelerator", default="gpu")
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--no_half", action="store_true", help="Save in float32")
-    parser.add_argument("--use_msa_server", action="store_true",
-                        help="Use MMseqs2 server for MSA generation")
-    parser.add_argument("--no_kernels", action="store_true",
-                        help="Disable custom CUDA kernels (use pure PyTorch)")
+    parser.add_argument("--use_msa_server", action="store_true")
+    parser.add_argument("--no_kernels", action="store_true")
     args = parser.parse_args()
 
     data_path = Path(args.data)
@@ -159,8 +119,7 @@ def main():
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load molecule data (Boltz2 uses mols/ directory, not ccd.pkl)
-    from boltz.data.mol import load_canonicals
+    # Validate molecule data exists
     mol_dir = cache / "mols"
     if not mol_dir.exists():
         print(f"ERROR: Molecule data not found at {mol_dir}")
@@ -168,16 +127,14 @@ def main():
         print(f"  wget -O {cache}/mols.tar https://huggingface.co/boltz-community/boltz-2/resolve/main/mols.tar")
         print(f"  cd {cache} && tar -xf mols.tar")
         sys.exit(1)
-    ccd = load_canonicals(mol_dir)
 
-    # Discover and validate input files
+    # --- Step 1: Process inputs (same as boltz predict) ---
     input_paths = check_inputs(data_path)
     if not input_paths:
         print(f"ERROR: No YAML/FASTA files found in {data_path}")
         sys.exit(1)
     print(f"Found {len(input_paths)} input files")
 
-    # Process inputs (tokenize, compute MSA, etc.)
     processing_dir = out_dir / "_processing"
     ccd_path = cache / "ccd.pkl"
     manifest = process_inputs(
@@ -191,34 +148,43 @@ def main():
         max_msa_seqs=4096,
         boltz2=True,
     )
-    # Build a processed-input-like object for the data module
     processed_targets = processing_dir / "processed" / "targets"
     processed_msa = processing_dir / "processed" / "msa"
 
-    # Load model
+    # --- Step 2: Load model (EXACT same way as boltz predict) ---
     predict_args = {
         "recycling_steps": args.recycling_steps,
         "sampling_steps": args.sampling_steps,
         "diffusion_samples": args.diffusion_samples,
         "max_parallel_samples": 1,
+        "write_confidence_summary": False,
+        "write_full_pae": False,
+        "write_full_pde": False,
     }
 
-    from boltz.model.models.boltz2 import Boltz2
+    diffusion_params = Boltz2DiffusionParams()
+    pairformer_args = PairformerArgsV2()
+    msa_args = MSAModuleArgs(subsample_msa=False, use_paired_feature=True)
+    steering_args = BoltzSteeringParams()
+    steering_args.fk_steering = False
+    steering_args.physical_guidance_update = False
+    steering_args.contact_guidance_update = False
 
-    # Only override runtime inference params. Let the checkpoint's saved
-    # hyperparameters define the model architecture (pairformer blocks,
-    # attention variant, MSA config, etc.) to avoid version mismatches.
     model = Boltz2.load_from_checkpoint(
         str(checkpoint),
-        strict=False,
+        strict=True,
         predict_args=predict_args,
         map_location="cpu",
+        diffusion_process_args=asdict(diffusion_params),
         ema=False,
+        use_kernels=not args.no_kernels,
+        pairformer_args=asdict(pairformer_args),
+        msa_args=asdict(msa_args),
+        steering_args=asdict(steering_args),
     )
-    model.use_kernels = not args.no_kernels
     model.eval()
 
-    # Create data module
+    # --- Step 3: Run prediction with cache writer ---
     data_module = Boltz2InferenceDataModule(
         manifest=manifest,
         target_dir=processed_targets,
@@ -227,7 +193,6 @@ def main():
         num_workers=args.num_workers,
     )
 
-    # Set up trainer with cache writer
     cache_writer = EvolutionCacheWriter(
         output_dir=str(out_dir),
         save_half=not args.no_half,
