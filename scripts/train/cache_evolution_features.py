@@ -137,39 +137,6 @@ class BoltzDiffusionParams:
     coordinate_augmentation: bool = True
     alignment_reverse_diff: bool = True
     synchronize_sigmas: bool = True
-    use_inference_model_cache: bool = True
-
-
-@dataclass
-class BoltzPairformerParams:
-    num_blocks: int = 48
-    num_heads: int = 16
-    dropout: float = 0.25
-    activation_checkpointing: bool = False
-    offload_to_cpu: bool = False
-
-
-@dataclass
-class BoltzMSAParams:
-    msa_s: int = 64
-    msa_blocks: int = 4
-    msa_dropout: float = 0.15
-    z_dropout: float = 0.25
-    pairwise_head_width: int = 32
-    pairwise_num_heads: int = 4
-    activation_checkpointing: bool = False
-    offload_to_cpu: bool = False
-
-
-@dataclass
-class BoltzSteeringParams:
-    fk_steering: bool = False
-    num_particles: int = 3
-    fk_lambda: float = 4.0
-    fk_resampling_interval: int = 3
-    physical_guidance_update: bool = False
-    num_gd_steps: int = 16
-    contact_guidance_update: bool = False
 
 
 def main():
@@ -254,9 +221,6 @@ def main():
     }
 
     diffusion_params = BoltzDiffusionParams()
-    pairformer_params = BoltzPairformerParams()
-    msa_params = BoltzMSAParams()
-    steering_params = BoltzSteeringParams()
 
     from boltz.model.models.boltz2 import Boltz2
 
@@ -266,9 +230,6 @@ def main():
         predict_args=predict_args,
         map_location="cpu",
         diffusion_process_args=asdict(diffusion_params),
-        pairformer_args=asdict(pairformer_params),
-        msa_args=asdict(msa_params),
-        steering_args=asdict(steering_params),
         ema=False,
         use_kernels=not args.no_kernels,
     )
