@@ -209,14 +209,16 @@ def main():
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load CCD
+    # Load molecule data (Boltz2 uses mols/ directory, not ccd.pkl)
     from boltz.data.mol import load_canonicals
-    ccd_path = cache / "ccd.pkl"
-    if not ccd_path.exists():
-        print(f"ERROR: CCD dictionary not found at {ccd_path}")
-        print("Run `boltz predict` once to download it, or place ccd.pkl in the cache dir.")
+    mol_dir = cache / "mols"
+    if not mol_dir.exists():
+        print(f"ERROR: Molecule data not found at {mol_dir}")
+        print("Run `boltz predict` once to download it, or download manually:")
+        print(f"  wget -O {cache}/mols.tar https://huggingface.co/boltz-community/boltz-2/resolve/main/mols.tar")
+        print(f"  cd {cache} && tar -xf mols.tar")
         sys.exit(1)
-    ccd = load_canonicals(ccd_path)
+    ccd = load_canonicals(mol_dir)
 
     # Discover input files
     input_paths = sorted(
@@ -274,12 +276,11 @@ def main():
     model.eval()
 
     # Create data module
-    mol_dir = cache / "boltz2"
     data_module = Boltz2InferenceDataModule(
         manifest=processed.manifest,
         target_dir=processed.targets_dir,
         msa_dir=processed.msa_dir,
-        mol_dir=mol_dir if mol_dir.exists() else None,
+        mol_dir=mol_dir,
         num_workers=args.num_workers,
     )
 
