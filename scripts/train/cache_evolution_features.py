@@ -56,7 +56,7 @@ class EvolutionCacheWriter(BasePredictionWriter):
         if prediction.get("exception", False):
             return
 
-        record_id = batch["pdb_id"][0]
+        record_id = batch["record"][0].id
         out_path = self.output_dir / f"{record_id}.pt"
 
         maybe_half = lambda t: t.half() if self.save_half else t  # noqa: E731
