@@ -1,0 +1,30 @@
+Bootstrap: docker
+From: nvidia/cuda:12.4.0-runtime-ubuntu22.04
+
+%labels
+    Author evolution-head
+    Description Boltz2 with evolution prediction head
+
+%post
+    apt-get update && apt-get install -y --no-install-recommends \
+        python3 python3-pip python3-venv git wget && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+    python3 -m venv /opt/venv
+    . /opt/venv/bin/activate
+
+    pip install --no-cache-dir --upgrade pip setuptools wheel
+
+    # Install boltz from our fork (includes evolution head)
+    cd /opt
+    git clone https://github.com/w-jiaqi/boltz.git boltz
+    cd boltz
+    git checkout cursor/affinity-prediction-architecture-cb9b
+    pip install --no-cache-dir -e ".[cuda]"
+
+%environment
+    export PATH="/opt/venv/bin:$PATH"
+    export VIRTUAL_ENV="/opt/venv"
+
+%runscript
+    exec "$@"
