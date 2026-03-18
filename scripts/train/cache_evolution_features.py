@@ -137,7 +137,6 @@ class BoltzDiffusionParams:
     coordinate_augmentation: bool = True
     alignment_reverse_diff: bool = True
     synchronize_sigmas: bool = True
-    use_inference_model_cache: bool = True
 
 
 @dataclass
