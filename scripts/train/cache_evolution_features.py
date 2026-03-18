@@ -2,7 +2,7 @@
 
 Runs Boltz2 inference on input structures and saves the intermediate
 representations needed by the EvolutionModule. Uses the EXACT same
-model loading path as `boltz predict` to avoid version mismatches.
+model loading and data pipeline as `boltz predict`.
 
 Usage:
     python scripts/train/cache_evolution_features.py \
@@ -25,8 +25,10 @@ import torch
 from pytorch_lightning.callbacks import BasePredictionWriter
 
 from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
+from boltz.data.types import Manifest
 from boltz.main import (
     Boltz2DiffusionParams,
+    BoltzProcessedInput,
     BoltzSteeringParams,
     MSAModuleArgs,
     PairformerArgsV2,
@@ -66,8 +68,6 @@ class EvolutionCacheWriter(BasePredictionWriter):
         coords = prediction["coords"]
         x_pred = coords[best_idx] if coords.dim() == 3 else coords
 
-        # Reconstruct s_inputs by running the input embedder on the batch
-        # (cheap operation, avoids needing s_inputs in predict_step output)
         with torch.no_grad():
             device = next(pl_module.parameters()).device
             batch_device = {
@@ -119,27 +119,22 @@ def main():
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Validate molecule data exists
     mol_dir = cache / "mols"
     if not mol_dir.exists():
         print(f"ERROR: Molecule data not found at {mol_dir}")
-        print("Run `boltz predict` once to download it, or download manually:")
-        print(f"  wget -O {cache}/mols.tar https://huggingface.co/boltz-community/boltz-2/resolve/main/mols.tar")
-        print(f"  cd {cache} && tar -xf mols.tar")
         sys.exit(1)
 
-    # --- Step 1: Process inputs (same as boltz predict) ---
+    # ---- Step 1: Process inputs (same as boltz predict) ----
     input_paths = check_inputs(data_path)
     if not input_paths:
         print(f"ERROR: No YAML/FASTA files found in {data_path}")
         sys.exit(1)
     print(f"Found {len(input_paths)} input files")
 
-    processing_dir = out_dir / "_processing"
     ccd_path = cache / "ccd.pkl"
-    manifest = process_inputs(
+    process_inputs(
         data=input_paths,
-        out_dir=processing_dir,
+        out_dir=out_dir,
         ccd_path=ccd_path,
         mol_dir=mol_dir,
         use_msa_server=args.use_msa_server,
@@ -148,17 +143,41 @@ def main():
         max_msa_seqs=4096,
         boltz2=True,
     )
-    processed_targets = processing_dir / "processed" / "targets"
-    processed_msa = processing_dir / "processed" / "msa"
 
-    # process_inputs may return None when all inputs are already processed
-    if manifest is None:
-        from boltz.data.types import Manifest
-        manifest_path = processing_dir / "processed" / "manifest.json"
-        manifest = Manifest.load(manifest_path)
+    # Load manifest (same as boltz predict line 1180)
+    manifest = Manifest.load(out_dir / "processed" / "manifest.json")
     print(f"Manifest has {len(manifest.records)} records")
 
-    # --- Step 2: Load model (EXACT same way as boltz predict) ---
+    # Build processed input paths (same as boltz predict lines 1190-1208)
+    processed_dir = out_dir / "processed"
+    processed = BoltzProcessedInput(
+        manifest=manifest,
+        targets_dir=processed_dir / "structures",
+        msa_dir=processed_dir / "msa",
+        constraints_dir=(
+            (processed_dir / "constraints")
+            if (processed_dir / "constraints").exists()
+            else None
+        ),
+        template_dir=(
+            (processed_dir / "templates")
+            if (processed_dir / "templates").exists()
+            else None
+        ),
+        extra_mols_dir=(
+            (processed_dir / "mols") if (processed_dir / "mols").exists() else None
+        ),
+    )
+
+    # ---- Step 2: Load model (same as boltz predict lines 1228-1326) ----
+    diffusion_params = Boltz2DiffusionParams()
+    diffusion_params.step_scale = 1.5
+    pairformer_args = PairformerArgsV2()
+    msa_args = MSAModuleArgs(subsample_msa=False, use_paired_feature=True)
+    steering_args = BoltzSteeringParams()
+    steering_args.fk_steering = False
+    steering_args.physical_guidance_update = False
+
     predict_args = {
         "recycling_steps": args.recycling_steps,
         "sampling_steps": args.sampling_steps,
@@ -168,14 +187,6 @@ def main():
         "write_full_pae": False,
         "write_full_pde": False,
     }
-
-    diffusion_params = Boltz2DiffusionParams()
-    pairformer_args = PairformerArgsV2()
-    msa_args = MSAModuleArgs(subsample_msa=False, use_paired_feature=True)
-    steering_args = BoltzSteeringParams()
-    steering_args.fk_steering = False
-    steering_args.physical_guidance_update = False
-    steering_args.contact_guidance_update = False
 
     model = Boltz2.load_from_checkpoint(
         str(checkpoint),
@@ -191,15 +202,19 @@ def main():
     )
     model.eval()
 
-    # --- Step 3: Run prediction with cache writer ---
+    # ---- Step 3: Create data module (same as boltz predict lines 1271-1282) ----
     data_module = Boltz2InferenceDataModule(
-        manifest=manifest,
-        target_dir=processed_targets,
-        msa_dir=processed_msa,
+        manifest=processed.manifest,
+        target_dir=processed.targets_dir,
+        msa_dir=processed.msa_dir,
         mol_dir=mol_dir,
         num_workers=args.num_workers,
+        constraints_dir=processed.constraints_dir,
+        template_dir=processed.template_dir,
+        extra_mols_dir=processed.extra_mols_dir,
     )
 
+    # ---- Step 4: Run prediction with cache writer ----
     cache_writer = EvolutionCacheWriter(
         output_dir=str(out_dir),
         save_half=not args.no_half,
@@ -211,6 +226,7 @@ def main():
         callbacks=[cache_writer],
         logger=False,
         enable_checkpointing=False,
+        precision="bf16-mixed",
     )
 
     print(f"\nCaching representations to {out_dir} ...")
