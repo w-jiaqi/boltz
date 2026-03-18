@@ -151,6 +151,13 @@ def main():
     processed_targets = processing_dir / "processed" / "targets"
     processed_msa = processing_dir / "processed" / "msa"
 
+    # process_inputs may return None when all inputs are already processed
+    if manifest is None:
+        from boltz.data.types import Manifest
+        manifest_path = processing_dir / "processed" / "manifest.json"
+        manifest = Manifest.load(manifest_path)
+    print(f"Manifest has {len(manifest.records)} records")
+
     # --- Step 2: Load model (EXACT same way as boltz predict) ---
     predict_args = {
         "recycling_steps": args.recycling_steps,
