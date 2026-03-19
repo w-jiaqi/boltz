@@ -1,28 +1,3 @@
-"""Train the evolution head on cached trunk representations.
-
-This script trains ONLY the EvolutionModule (the evolution head) using
-cached trunk outputs. The trunk (pairformer, MSA module, input embedder,
-diffusion, confidence) is NOT loaded or run — only the lightweight
-evolution head is trained.
-
-Prerequisites:
-    1. Cached trunk representations (.pt files) produced by
-       cache_evolution_features.py
-    2. A pairs CSV defining which complexes to compare and their
-       evolutionary distances
-
-Usage:
-    python scripts/train/train_evolution.py scripts/train/configs/evolution.yaml
-
-    # With overrides:
-    python scripts/train/train_evolution.py scripts/train/configs/evolution.yaml \
-        training.lr=1e-3 training.bt_temperature=0.5
-
-    # Debug mode (single device, no wandb, num_workers=0):
-    python scripts/train/train_evolution.py scripts/train/configs/evolution.yaml \
-        debug=true
-"""
-
 import csv
 import os
 import sys
@@ -47,10 +22,6 @@ from boltz.model.loss.evolution import (
 from boltz.model.modules.evolution import EvolutionModule
 
 
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
-
 CACHED_FEAT_KEYS = [
     "token_pad_mask",
     "token_to_rep_atom",
@@ -60,7 +31,6 @@ CACHED_FEAT_KEYS = [
 
 
 def _load_cached(path: Path) -> dict:
-    """Load a cached .pt file and return tensors ready for the evolution module."""
     data = torch.load(path, map_location="cpu", weights_only=False)
     return {
         "s_inputs": data["s_inputs"],
@@ -71,23 +41,7 @@ def _load_cached(path: Path) -> dict:
 
 
 class PairedEvolutionDataset(Dataset):
-    """Dataset that yields pairs of cached representations for BT training.
-
-    Each item returns a dict with 'preferred' and 'dispreferred' cached
-    tensors, plus evolutionary distances for both.
-
-    Parameters
-    ----------
-    cache_dir : str or Path
-        Directory containing per-complex .pt files.
-    pairs_csv : str or Path
-        CSV file with columns:
-            preferred      - complex ID (should have lower energy)
-            dispreferred   - complex ID (should have higher energy)
-            dist_preferred - evolutionary distance of preferred (e.g. 0.0)
-            dist_dispreferred - evolutionary distance of dispreferred
-    """
-
+    """Dataset for BT training."""
     def __init__(self, cache_dir: str, pairs_csv: str):
         self.cache_dir = Path(cache_dir)
         self.pairs = []
@@ -122,7 +76,6 @@ class PairedEvolutionDataset(Dataset):
 
 
 def _collate_fn(batch):
-    """Custom collate for batch_size=1 (no padding needed)."""
     assert len(batch) == 1
     item = batch[0]
     for side in ("preferred", "dispreferred"):
@@ -144,26 +97,12 @@ def _collate_fn(batch):
     return item
 
 
-# ---------------------------------------------------------------------------
-# Lightning Module
-# ---------------------------------------------------------------------------
-
-
 class EvolutionTrainingModule(pl.LightningModule):
-    """Lightning module that trains ONLY the EvolutionModule.
-
-    Each training step:
-        1. Forward pass on the preferred complex → E_preferred
-        2. Forward pass on the dispreferred complex → E_dispreferred
-        3. Compute BT loss + optional margin loss
-        4. Backward + optimize
-
-    Parameters
-    ----------
-    evolution_model_args : dict
-        Arguments for EvolutionModule (token_s, token_z, pairformer_args, etc.)
-    training_args : dict
-        Training hyperparameters (lr, bt_weight, margin_weight, etc.)
+    """
+        1. Forward pass on the preferred complex
+        2. Forward pass on the dispreferred complex
+        3. Compute BT loss
+        4. Backward
     """
 
     def __init__(
@@ -318,13 +257,41 @@ class EvolutionTrainingModule(pl.LightningModule):
         return optimizer
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class TrainEvolutionConfig:
+    """Evolution head training configuration.
+
+    Attributes
+    ----------
+    cache_dir : str
+        Directory containing per-complex cached .pt files.
+    train_pairs_csv : str
+        CSV of (preferred, dispreferred) pairs for training.
+    val_pairs_csv : Optional[str]
+        CSV of pairs for validation.
+    output : str
+        Output directory for checkpoints and logs.
+    evolution_model_args : dict
+        Arguments forwarded to EvolutionModule.
+    training : dict
+        Training hyperparameters (lr, bt_weight, margin_weight, etc.)
+    trainer : dict
+        pytorch-lightning Trainer kwargs.
+    wandb : Optional[dict]
+        Weights & Biases logger configuration.
+    pretrained : Optional[str]
+        Path to a pretrained evolution checkpoint to warm-start from.
+    resume : Optional[str]
+        Path to a checkpoint to resume training from.
+    debug : bool
+        Debug mode (single device, no wandb, num_workers=0).
+    num_workers : int
+        Number of DataLoader worker processes.
+    save_top_k : int
+        Number of best checkpoints to keep.
+
+    """
+
     cache_dir: str
     train_pairs_csv: str
     val_pairs_csv: Optional[str] = None
@@ -341,7 +308,7 @@ class TrainEvolutionConfig:
 
 
 def train(raw_config_path: str, args: list[str]) -> None:
-    """Run evolution head training."""
+    # Load the configuration
     raw_config = omegaconf.OmegaConf.load(raw_config_path)
     if args:
         overrides = omegaconf.OmegaConf.from_dotlist(args)
@@ -349,10 +316,9 @@ def train(raw_config_path: str, args: list[str]) -> None:
 
     cfg = omegaconf.OmegaConf.to_container(raw_config, resolve=True)
     cfg = TrainEvolutionConfig(**cfg)
-
-    # ---------- Datasets ----------
     num_workers = 0 if cfg.debug else cfg.num_workers
 
+    # Create datasets
     train_ds = PairedEvolutionDataset(cfg.cache_dir, cfg.train_pairs_csv)
     train_loader = DataLoader(
         train_ds,
@@ -375,7 +341,7 @@ def train(raw_config_path: str, args: list[str]) -> None:
             pin_memory=True,
         )
 
-    # ---------- Model ----------
+    # Create objects
     model = EvolutionTrainingModule(
         evolution_model_args=dict(cfg.evolution_model_args),
         training_args=dict(cfg.training),
@@ -387,7 +353,7 @@ def train(raw_config_path: str, args: list[str]) -> None:
         state = ckpt.get("state_dict", ckpt)
         model.load_state_dict(state, strict=False)
 
-    # ---------- Callbacks ----------
+    # Create checkpoint callback
     callbacks = []
     mc = ModelCheckpoint(
         dirpath=os.path.join(cfg.output, "checkpoints"),
@@ -400,7 +366,7 @@ def train(raw_config_path: str, args: list[str]) -> None:
     )
     callbacks.append(mc)
 
-    # ---------- Logger ----------
+    # Create wandb logger
     loggers = []
     wandb_cfg = cfg.wandb if not cfg.debug else None
     if wandb_cfg:
@@ -414,16 +380,15 @@ def train(raw_config_path: str, args: list[str]) -> None:
         loggers.append(wdb_logger)
 
         @rank_zero_only
-        def save_config():
+        def save_config_to_wandb() -> None:
             config_out = Path(wdb_logger.experiment.dir) / "evolution_config.yaml"
             omegaconf.OmegaConf.save(raw_config, config_out)
             wdb_logger.experiment.save(str(config_out))
 
-        save_config()
+        save_config_to_wandb()
 
-    # ---------- Trainer ----------
-    trainer_kwargs = dict(cfg.trainer)
-    devices = trainer_kwargs.pop("devices", 1)
+    # Set up trainer
+    devices = cfg.trainer.pop("devices", 1)
     if cfg.debug:
         devices = 1
 
@@ -440,10 +405,10 @@ def train(raw_config_path: str, args: list[str]) -> None:
         callbacks=callbacks,
         logger=loggers,
         enable_checkpointing=True,
-        **trainer_kwargs,
+        **cfg.trainer,
     )
 
-    # ---------- Train ----------
+    # Train
     trainer.fit(
         model,
         train_dataloaders=train_loader,

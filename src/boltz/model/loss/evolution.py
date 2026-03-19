@@ -1,49 +1,3 @@
-"""Loss functions for evolution head training.
-
-These losses learn a scalar energy E(A, B) from RELATIVE supervision only
-(no absolute ground-truth labels). Low energy = evolutionarily compatible,
-high energy = mismatched.
-
-Three complementary losses are provided:
-
-1. Bradley-Terry (BT) pairwise comparison loss
-   - Enforces correct ordering: E(matched) < E(swapped)
-   - Only needs binary "which is better" labels
-
-2. Margin ranking loss with evolutionary distance scaling
-   - Enforces ordering AND proportional spacing:
-     the energy gap should scale with evolutionary distance gap
-   - Needs evolutionary distances d(s, t)
-
-3. Listwise KL divergence loss
-   - Matches the model's energy-induced distribution to a target
-     distribution derived from evolutionary distances
-   - Elegant probabilistic interpretation
-   - Needs evolutionary distances for a set of candidates
-
-Training setup
---------------
-Since these losses compare PAIRS (or sets) of predictions, the training
-loop must provide paired data. Two practical approaches:
-
-(A) Paired forward passes:
-    For each training step, run the model on two related complexes
-    (A_s, B_s) and (A_s, B_t), compute energies E_matched and E_swapped,
-    then apply BT/margin loss.
-
-(B) Cached representations:
-    Pre-compute (z, s_inputs, x_pred, feats) for all complexes with
-    the frozen trunk, cache to disk, then train the evolution head
-    cheaply on cached features with paired sampling.
-
-Gauge trick
------------
-For each anchor species s, define:
-    Delta_E(s, t) = E(A_s, B_t) - E(A_s, B_s)
-This makes Delta_E(s, s) = 0 automatically, removing the need for
-absolute energy calibration.
-"""
-
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -179,9 +133,6 @@ def evolution_loss(
     margin_alpha: float = 1.0,
 ) -> dict:
     """Combined evolution loss.
-
-    Convenience wrapper that computes a weighted sum of Bradley-Terry
-    and margin ranking losses.
 
     Parameters
     ----------

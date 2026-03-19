@@ -1,19 +1,3 @@
-"""Cache trunk representations for evolution head training.
-
-Runs Boltz2 inference on input structures and saves the intermediate
-representations needed by the EvolutionModule. Uses the EXACT same
-model loading and data pipeline as `boltz predict`.
-
-Usage:
-    python scripts/train/cache_evolution_features.py \
-        --data /path/to/structures/ \
-        --output /path/to/cache/ \
-        --checkpoint /path/to/boltz2_conf.ckpt \
-        --cache /path/to/boltz_cache \
-        --use_msa_server \
-        --no_kernels
-"""
-
 import argparse
 import sys
 from dataclasses import asdict
@@ -60,7 +44,7 @@ class EvolutionCacheWriter(BasePredictionWriter):
         record_id = batch["record"][0].id
         out_path = self.output_dir / f"{record_id}.pt"
 
-        maybe_half = lambda t: t.half() if self.save_half else t  # noqa: E731
+        maybe_half = lambda t: t.half() if self.save_half else t
 
         if self.skip_diffusion:
             # Use ground truth coords from the batch as x_pred
@@ -141,7 +125,7 @@ def main():
         print(f"ERROR: Molecule data not found at {mol_dir}")
         sys.exit(1)
 
-    # ---- Step 1: Process inputs (same as boltz predict) ----
+    # Process inputs (same as boltz predict)
     input_paths = check_inputs(data_path)
     if not input_paths:
         print(f"ERROR: No YAML/FASTA files found in {data_path}")
@@ -186,7 +170,7 @@ def main():
         ),
     )
 
-    # ---- Step 2: Load model (same as boltz predict lines 1228-1326) ----
+    # Load model
     diffusion_params = Boltz2DiffusionParams()
     diffusion_params.step_scale = 1.5
     pairformer_args = PairformerArgsV2()
@@ -226,7 +210,7 @@ def main():
     model = Boltz2.load_from_checkpoint(str(checkpoint), **load_kwargs)
     model.eval()
 
-    # ---- Step 3: Create data module (same as boltz predict lines 1271-1282) ----
+    # Create data module
     data_module = Boltz2InferenceDataModule(
         manifest=processed.manifest,
         target_dir=processed.targets_dir,
@@ -238,7 +222,7 @@ def main():
         extra_mols_dir=processed.extra_mols_dir,
     )
 
-    # ---- Step 4: Run prediction with cache writer ----
+    # Run prediction with cache writer
     cache_writer = EvolutionCacheWriter(
         output_dir=str(out_dir),
         save_half=not args.no_half,
