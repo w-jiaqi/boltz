@@ -3,51 +3,47 @@
 # Usage:
 #   python scripts/train/train_evolution.py scripts/train/configs/evolution.yaml
 #
-# Override any value from the command line:
+# Override any value:
 #   python scripts/train/train_evolution.py scripts/train/configs/evolution.yaml \
-#       training.lr=5e-4 training.bt_temperature=0.5 debug=true
+#       training.lr=5e-4 debug=true data_dir=/my/data
 
 # ----- Data -----
-cache_dir: SET_PATH_HERE                  # Directory containing cached .pt files from cache_evolution_features.py
-train_pairs_csv: SET_PATH_HERE            # CSV with columns: preferred,dispreferred,dist_preferred,dist_dispreferred
-val_pairs_csv: null                       # Optional validation pairs CSV (same format)
+# Must contain: cache/*.pt, train_pairs.csv, (optional) val_pairs.csv
+# Produced by prepare_evolution_data.py + cache_evolution_features.py
+data_dir: SET_PATH_HERE
 
 # ----- Output -----
-output: SET_PATH_HERE                     # Output directory for checkpoints and logs
-pretrained: null                          # Optional: path to a pretrained evolution checkpoint to resume from
-resume: null                              # Optional: path to a Lightning checkpoint to resume training
+output: SET_PATH_HERE
+pretrained: null                          # Path to a pretrained evolution checkpoint
+resume: null                              # Path to a Lightning checkpoint to resume
 
 # ----- Evolution module architecture -----
-# These should match the Boltz2 trunk dimensions (token_s=384, token_z=128)
+# Must match Boltz2 trunk dimensions (token_s=384, token_z=128)
 evolution_model_args:
   token_s: 384
   token_z: 128
   pairformer_args:
-    num_blocks: 4                         # Small pairformer for the evolution head
+    num_blocks: 4
     dropout: 0.25
     pairwise_head_width: 32
     pairwise_num_heads: 4
     activation_checkpointing: false
-  head_hidden_dim: 384                    # Hidden dim for the prediction MLP
+  head_hidden_dim: 384
   num_dist_bins: 64
   max_dist: 22
-  use_interface_mask: false               # false = all pairs, true = interface-only (like affinity)
+  use_interface_mask: false               # false=all pairs, true=interface only
 
-# ----- Training hyperparameters -----
+# ----- Training -----
 training:
   lr: 1.8e-3
   adam_beta_1: 0.9
   adam_beta_2: 0.95
   adam_eps: 1.0e-8
   weight_decay: 0.0
-
-  # Loss weights
-  bt_weight: 1.0                          # Weight for Bradley-Terry loss
-  margin_weight: 0.5                      # Weight for margin ranking loss (set 0 to disable)
-  bt_temperature: 1.0                     # Temperature for BT comparison
-  margin_alpha: 1.0                       # Margin scaling factor for distance gaps
-
-  # LR schedule: null, "cosine", or "linear_warmup_cosine"
+  bt_weight: 1.0                          # Bradley-Terry loss weight
+  margin_weight: 0.5                      # Margin ranking loss weight (0 to disable)
+  bt_temperature: 1.0
+  margin_alpha: 1.0
   lr_scheduler: linear_warmup_cosine
   lr_warmup_steps: 1000
   lr_cosine_T_max: 50000
@@ -60,15 +56,16 @@ trainer:
   precision: 32
   gradient_clip_val: 10.0
   max_epochs: 100
-  accumulate_grad_batches: 16             # Effective batch size = 16 pairs
+  accumulate_grad_batches: 16
   check_val_every_n_epoch: 1
 
 # ----- Misc -----
 num_workers: 4
 save_top_k: 3
-debug: false                              # Debug mode: single device, no wandb, num_workers=0
+max_cached_in_memory: 2000                # LRU cache size for .pt files
+debug: false
 
-# ----- Optional wandb logging -----
+# ----- Wandb (uncomment to enable) -----
 # wandb:
 #   name: evolution-head
 #   project: boltz-evolution

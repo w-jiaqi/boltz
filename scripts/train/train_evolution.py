@@ -1,32 +1,33 @@
 """Train the evolution head on cached trunk representations.
 
-This script trains ONLY the EvolutionModule (the evolution head) using
-cached trunk outputs. The trunk (pairformer, MSA module, input embedder,
-diffusion, confidence) is NOT loaded or run — only the lightweight
-evolution head is trained.
+COMMAND 2 of the evolution training pipeline.
+
+Trains ONLY the EvolutionModule using cached trunk outputs (.pt files).
+The trunk is NOT loaded — only the lightweight evolution head is trained.
 
 Prerequisites:
-    1. Cached trunk representations (.pt files) produced by
-       cache_evolution_features.py
-    2. A pairs CSV defining which complexes to compare and their
-       evolutionary distances
+    1. Run prepare_evolution_data.py to create structures/ and pairs CSVs
+    2. Run cache_evolution_features.py to create cache/ with .pt files
 
 Usage:
     python scripts/train/train_evolution.py scripts/train/configs/evolution.yaml
 
-    # With overrides:
-    python scripts/train/train_evolution.py scripts/train/configs/evolution.yaml \
-        training.lr=1e-3 training.bt_temperature=0.5
+    # Override any config value:
+    python scripts/train/train_evolution.py scripts/train/configs/evolution.yaml \\
+        training.lr=1e-3 debug=true
 
-    # Debug mode (single device, no wandb, num_workers=0):
-    python scripts/train/train_evolution.py scripts/train/configs/evolution.yaml \
-        debug=true
+Data directory layout (produced by prepare_evolution_data.py):
+    data_dir/
+    ├── cache/                # .pt files from cache_evolution_features.py
+    ├── train_pairs.csv       # Bradley-Terry training pairs
+    └── val_pairs.csv         # Validation pairs (optional)
 """
 
 import csv
 import os
 import sys
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -39,11 +40,7 @@ from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.utilities import rank_zero_only
 from torch.utils.data import DataLoader, Dataset
 
-from boltz.model.loss.evolution import (
-    bradley_terry_loss,
-    evolution_loss,
-    margin_ranking_loss,
-)
+from boltz.model.loss.evolution import evolution_loss
 from boltz.model.modules.evolution import EvolutionModule
 
 
@@ -59,88 +56,93 @@ CACHED_FEAT_KEYS = [
 ]
 
 
-def _load_cached(path: Path) -> dict:
-    """Load a cached .pt file and return tensors ready for the evolution module."""
-    data = torch.load(path, map_location="cpu", weights_only=False)
-    return {
-        "s_inputs": data["s_inputs"],
-        "z": data["z"],
-        "x_pred": data["x_pred"],
-        "feats": {k: data[k] for k in CACHED_FEAT_KEYS if k in data},
-    }
+class CachedComplexStore:
+    """In-memory LRU cache for loaded .pt files.
+
+    Many training pairs reference the same complex (e.g. a native complex
+    appears in dozens of pairs). This avoids re-reading from disk.
+    """
+
+    def __init__(self, cache_dir: str, max_in_memory: int = 2000):
+        self.cache_dir = Path(cache_dir)
+        self._load = lru_cache(maxsize=max_in_memory)(self._load_impl)
+
+    def _load_impl(self, complex_id: str) -> dict:
+        path = self.cache_dir / f"{complex_id}.pt"
+        data = torch.load(path, map_location="cpu", weights_only=False)
+        return {
+            "s_inputs": data["s_inputs"],
+            "z": data["z"],
+            "x_pred": data["x_pred"],
+            "feats": {k: data[k] for k in CACHED_FEAT_KEYS if k in data},
+        }
+
+    def get(self, complex_id: str) -> dict:
+        """Return a deep copy so collate/unsqueeze doesn't mutate cached tensors."""
+        cached = self._load(complex_id)
+        return {
+            "s_inputs": cached["s_inputs"].clone(),
+            "z": cached["z"].clone(),
+            "x_pred": cached["x_pred"].clone(),
+            "feats": {k: v.clone() for k, v in cached["feats"].items()},
+        }
+
+    def validate(self, complex_ids: set) -> list[str]:
+        """Return list of IDs that are missing from cache."""
+        return [cid for cid in complex_ids if not (self.cache_dir / f"{cid}.pt").exists()]
 
 
 class PairedEvolutionDataset(Dataset):
-    """Dataset that yields pairs of cached representations for BT training.
+    """Dataset of Bradley-Terry comparison pairs.
 
-    Each item returns a dict with 'preferred' and 'dispreferred' cached
-    tensors, plus evolutionary distances for both.
-
-    Parameters
-    ----------
-    cache_dir : str or Path
-        Directory containing per-complex .pt files.
-    pairs_csv : str or Path
-        CSV file with columns:
-            preferred      - complex ID (should have lower energy)
-            dispreferred   - complex ID (should have higher energy)
-            dist_preferred - evolutionary distance of preferred (e.g. 0.0)
-            dist_dispreferred - evolutionary distance of dispreferred
+    Each item yields one (preferred, dispreferred) pair loaded from
+    the shared CachedComplexStore, plus evolutionary distances.
     """
 
-    def __init__(self, cache_dir: str, pairs_csv: str):
-        self.cache_dir = Path(cache_dir)
+    def __init__(self, store: CachedComplexStore, pairs_csv: str):
+        self.store = store
         self.pairs = []
         with open(pairs_csv) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
+            for row in csv.DictReader(f):
                 self.pairs.append(row)
 
-        missing = set()
+        referenced_ids = set()
         for row in self.pairs:
-            for key in ("preferred", "dispreferred"):
-                pt = self.cache_dir / f"{row[key]}.pt"
-                if not pt.exists():
-                    missing.add(str(pt))
+            referenced_ids.add(row["preferred"])
+            referenced_ids.add(row["dispreferred"])
+        missing = self.store.validate(referenced_ids)
         if missing:
-            msg = f"Missing {len(missing)} cached files. First 5: {list(missing)[:5]}"
-            raise FileNotFoundError(msg)
+            n = len(missing)
+            examples = missing[:5]
+            raise FileNotFoundError(
+                f"{n} cached .pt files missing. First 5: {examples}\n"
+                f"Run cache_evolution_features.py first."
+            )
 
     def __len__(self):
         return len(self.pairs)
 
     def __getitem__(self, idx):
         row = self.pairs[idx]
-        pref = _load_cached(self.cache_dir / f"{row['preferred']}.pt")
-        dispref = _load_cached(self.cache_dir / f"{row['dispreferred']}.pt")
         return {
-            "preferred": pref,
-            "dispreferred": dispref,
+            "preferred": self.store.get(row["preferred"]),
+            "dispreferred": self.store.get(row["dispreferred"]),
             "dist_preferred": float(row["dist_preferred"]),
             "dist_dispreferred": float(row["dist_dispreferred"]),
         }
 
 
 def _collate_fn(batch):
-    """Custom collate for batch_size=1 (no padding needed)."""
+    """Collate for batch_size=1. Adds batch dimension to all tensors."""
     assert len(batch) == 1
     item = batch[0]
     for side in ("preferred", "dispreferred"):
-        item[side]["s_inputs"] = item[side]["s_inputs"].unsqueeze(0)
-        item[side]["z"] = item[side]["z"].unsqueeze(0)
-        if item[side]["x_pred"].dim() == 2:
-            item[side]["x_pred"] = item[side]["x_pred"].unsqueeze(0)
+        for k in ("s_inputs", "z", "x_pred"):
+            item[side][k] = item[side][k].unsqueeze(0)
         for k in item[side]["feats"]:
-            if item[side]["feats"][k].dim() == 1:
-                item[side]["feats"][k] = item[side]["feats"][k].unsqueeze(0)
-            elif item[side]["feats"][k].dim() == 2:
-                item[side]["feats"][k] = item[side]["feats"][k].unsqueeze(0)
-    item["dist_preferred"] = torch.tensor(
-        [item["dist_preferred"]], dtype=torch.float32
-    )
-    item["dist_dispreferred"] = torch.tensor(
-        [item["dist_dispreferred"]], dtype=torch.float32
-    )
+            item[side]["feats"][k] = item[side]["feats"][k].unsqueeze(0)
+    item["dist_preferred"] = torch.tensor([item["dist_preferred"]], dtype=torch.float32)
+    item["dist_dispreferred"] = torch.tensor([item["dist_dispreferred"]], dtype=torch.float32)
     return item
 
 
@@ -150,38 +152,21 @@ def _collate_fn(batch):
 
 
 class EvolutionTrainingModule(pl.LightningModule):
-    """Lightning module that trains ONLY the EvolutionModule.
+    """Lightning module that trains the EvolutionModule.
 
-    Each training step:
-        1. Forward pass on the preferred complex → E_preferred
-        2. Forward pass on the dispreferred complex → E_dispreferred
-        3. Compute BT loss + optional margin loss
-        4. Backward + optimize
-
-    Parameters
-    ----------
-    evolution_model_args : dict
-        Arguments for EvolutionModule (token_s, token_z, pairformer_args, etc.)
-    training_args : dict
-        Training hyperparameters (lr, bt_weight, margin_weight, etc.)
+    Each step runs two forward passes (preferred + dispreferred complex)
+    and computes Bradley-Terry + optional margin ranking loss.
     """
 
-    def __init__(
-        self,
-        evolution_model_args: dict,
-        training_args: dict,
-    ):
+    def __init__(self, evolution_model_args: dict, training_args: dict):
         super().__init__()
         self.save_hyperparameters()
 
         token_s = evolution_model_args.pop("token_s", 384)
         token_z = evolution_model_args.pop("token_z", 128)
         self.evolution_module = EvolutionModule(
-            token_s=token_s,
-            token_z=token_z,
-            **evolution_model_args,
+            token_s=token_s, token_z=token_z, **evolution_model_args,
         )
-
         self.training_args = training_args
 
     def forward(self, s_inputs, z, x_pred, feats):
@@ -194,28 +179,21 @@ class EvolutionTrainingModule(pl.LightningModule):
         )
 
     def _run_pair(self, batch):
-        pref = batch["preferred"]
-        dispref = batch["dispreferred"]
-
         device = self.device
-        out_pref = self.forward(
-            s_inputs=pref["s_inputs"].to(device),
-            z=pref["z"].to(device),
-            x_pred=pref["x_pred"].to(device),
-            feats={k: v.to(device) for k, v in pref["feats"].items()},
-        )
-        out_dispref = self.forward(
-            s_inputs=dispref["s_inputs"].to(device),
-            z=dispref["z"].to(device),
-            x_pred=dispref["x_pred"].to(device),
-            feats={k: v.to(device) for k, v in dispref["feats"].items()},
-        )
-        return out_pref, out_dispref
+        results = []
+        for side in ("preferred", "dispreferred"):
+            d = batch[side]
+            results.append(self.forward(
+                s_inputs=d["s_inputs"].to(device),
+                z=d["z"].to(device),
+                x_pred=d["x_pred"].to(device),
+                feats={k: v.to(device) for k, v in d["feats"].items()},
+            ))
+        return results[0], results[1]
 
-    def training_step(self, batch, batch_idx):
+    def _compute_loss(self, batch):
         out_pref, out_dispref = self._run_pair(batch)
-
-        loss_dict = evolution_loss(
+        return evolution_loss(
             energies_preferred=out_pref["evo_energy"],
             energies_dispreferred=out_dispref["evo_energy"],
             distances_preferred=batch["dist_preferred"].to(self.device),
@@ -224,7 +202,10 @@ class EvolutionTrainingModule(pl.LightningModule):
             margin_weight=self.training_args.get("margin_weight", 0.0),
             bt_temperature=self.training_args.get("bt_temperature", 1.0),
             margin_alpha=self.training_args.get("margin_alpha", 1.0),
-        )
+        ), out_pref, out_dispref
+
+    def training_step(self, batch, batch_idx):
+        loss_dict, out_pref, out_dispref = self._compute_loss(batch)
 
         self.log("train/loss", loss_dict["loss"], prog_bar=True)
         self.log("train/bt_loss", loss_dict["loss_breakdown"]["bt_loss"])
@@ -232,29 +213,13 @@ class EvolutionTrainingModule(pl.LightningModule):
 
         e_pref = out_pref["evo_energy"].detach().mean()
         e_dispref = out_dispref["evo_energy"].detach().mean()
-        self.log("train/energy_preferred", e_pref)
-        self.log("train/energy_dispreferred", e_dispref)
         self.log("train/energy_gap", e_dispref - e_pref)
-        self.log(
-            "train/accuracy",
-            (e_pref < e_dispref).float(),
-        )
+        self.log("train/accuracy", (e_pref < e_dispref).float())
 
         return loss_dict["loss"]
 
     def validation_step(self, batch, batch_idx):
-        out_pref, out_dispref = self._run_pair(batch)
-
-        loss_dict = evolution_loss(
-            energies_preferred=out_pref["evo_energy"],
-            energies_dispreferred=out_dispref["evo_energy"],
-            distances_preferred=batch["dist_preferred"].to(self.device),
-            distances_dispreferred=batch["dist_dispreferred"].to(self.device),
-            bt_weight=self.training_args.get("bt_weight", 1.0),
-            margin_weight=self.training_args.get("margin_weight", 0.0),
-            bt_temperature=self.training_args.get("bt_temperature", 1.0),
-            margin_alpha=self.training_args.get("margin_alpha", 1.0),
-        )
+        loss_dict, out_pref, out_dispref = self._compute_loss(batch)
 
         self.log("val/loss", loss_dict["loss"], prog_bar=True, sync_dist=True)
         self.log("val/bt_loss", loss_dict["loss_breakdown"]["bt_loss"], sync_dist=True)
@@ -262,16 +227,12 @@ class EvolutionTrainingModule(pl.LightningModule):
         e_pref = out_pref["evo_energy"].detach().mean()
         e_dispref = out_dispref["evo_energy"].detach().mean()
         self.log("val/energy_gap", e_dispref - e_pref, sync_dist=True)
-        self.log(
-            "val/accuracy",
-            (e_pref < e_dispref).float(),
-            sync_dist=True,
-        )
+        self.log("val/accuracy", (e_pref < e_dispref).float(), sync_dist=True)
+
         return loss_dict["loss"]
 
     def configure_optimizers(self):
         lr = self.training_args.get("lr", 1.8e-3)
-        weight_decay = self.training_args.get("weight_decay", 0.0)
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=lr,
@@ -280,40 +241,28 @@ class EvolutionTrainingModule(pl.LightningModule):
                 self.training_args.get("adam_beta_2", 0.95),
             ),
             eps=self.training_args.get("adam_eps", 1e-8),
-            weight_decay=weight_decay,
+            weight_decay=self.training_args.get("weight_decay", 0.0),
         )
 
-        scheduler_type = self.training_args.get("lr_scheduler", None)
-        if scheduler_type == "cosine":
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        sched_type = self.training_args.get("lr_scheduler", None)
+        if sched_type == "cosine":
+            sched = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
                 T_max=self.training_args.get("lr_cosine_T_max", 50000),
                 eta_min=self.training_args.get("lr_min", 1e-6),
             )
-            return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
-        elif scheduler_type == "linear_warmup_cosine":
-            from torch.optim.lr_scheduler import (
-                CosineAnnealingLR,
-                LinearLR,
-                SequentialLR,
-            )
-
-            warmup = LinearLR(
-                optimizer,
-                start_factor=1e-3,
-                total_iters=self.training_args.get("lr_warmup_steps", 1000),
-            )
+            return [optimizer], [{"scheduler": sched, "interval": "step"}]
+        elif sched_type == "linear_warmup_cosine":
+            from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+            warmup_steps = self.training_args.get("lr_warmup_steps", 1000)
+            warmup = LinearLR(optimizer, start_factor=1e-3, total_iters=warmup_steps)
             cosine = CosineAnnealingLR(
                 optimizer,
                 T_max=self.training_args.get("lr_cosine_T_max", 50000),
                 eta_min=self.training_args.get("lr_min", 1e-6),
             )
-            scheduler = SequentialLR(
-                optimizer,
-                schedulers=[warmup, cosine],
-                milestones=[self.training_args.get("lr_warmup_steps", 1000)],
-            )
-            return [optimizer], [{"scheduler": scheduler, "interval": "step"}]
+            sched = SequentialLR(optimizer, [warmup, cosine], milestones=[warmup_steps])
+            return [optimizer], [{"scheduler": sched, "interval": "step"}]
 
         return optimizer
 
@@ -322,12 +271,9 @@ class EvolutionTrainingModule(pl.LightningModule):
 # Main
 # ---------------------------------------------------------------------------
 
-
 @dataclass
 class TrainEvolutionConfig:
-    cache_dir: str
-    train_pairs_csv: str
-    val_pairs_csv: Optional[str] = None
+    data_dir: str
     output: str = "./output_evolution"
     evolution_model_args: dict = field(default_factory=dict)
     training: dict = field(default_factory=dict)
@@ -338,6 +284,7 @@ class TrainEvolutionConfig:
     debug: bool = False
     num_workers: int = 4
     save_top_k: int = 3
+    max_cached_in_memory: int = 2000
 
 
 def train(raw_config_path: str, args: list[str]) -> None:
@@ -350,30 +297,47 @@ def train(raw_config_path: str, args: list[str]) -> None:
     cfg = omegaconf.OmegaConf.to_container(raw_config, resolve=True)
     cfg = TrainEvolutionConfig(**cfg)
 
+    data_dir = Path(cfg.data_dir)
+
+    # Auto-discover paths within data_dir
+    cache_dir = data_dir / "cache"
+    train_csv = data_dir / "train_pairs.csv"
+    val_csv = data_dir / "val_pairs.csv"
+
+    if not cache_dir.exists():
+        print(f"ERROR: {cache_dir} not found. Run cache_evolution_features.py first.")
+        sys.exit(1)
+    if not train_csv.exists():
+        print(f"ERROR: {train_csv} not found. Run prepare_evolution_data.py first.")
+        sys.exit(1)
+
     # ---------- Datasets ----------
     num_workers = 0 if cfg.debug else cfg.num_workers
 
-    train_ds = PairedEvolutionDataset(cfg.cache_dir, cfg.train_pairs_csv)
+    store = CachedComplexStore(
+        str(cache_dir),
+        max_in_memory=cfg.max_cached_in_memory,
+    )
+
+    train_ds = PairedEvolutionDataset(store, str(train_csv))
     train_loader = DataLoader(
-        train_ds,
-        batch_size=1,
-        shuffle=True,
-        num_workers=num_workers,
-        collate_fn=_collate_fn,
-        pin_memory=True,
+        train_ds, batch_size=1, shuffle=True,
+        num_workers=num_workers, collate_fn=_collate_fn, pin_memory=True,
     )
 
     val_loader = None
-    if cfg.val_pairs_csv:
-        val_ds = PairedEvolutionDataset(cfg.cache_dir, cfg.val_pairs_csv)
+    if val_csv.exists():
+        val_ds = PairedEvolutionDataset(store, str(val_csv))
         val_loader = DataLoader(
-            val_ds,
-            batch_size=1,
-            shuffle=False,
-            num_workers=num_workers,
-            collate_fn=_collate_fn,
-            pin_memory=True,
+            val_ds, batch_size=1, shuffle=False,
+            num_workers=num_workers, collate_fn=_collate_fn, pin_memory=True,
         )
+
+    print(f"Data dir:        {data_dir}")
+    print(f"Cache dir:       {cache_dir}")
+    print(f"Train pairs:     {len(train_ds)}")
+    print(f"Val pairs:       {len(val_ds) if val_loader else 0}")
+    print(f"Cached in memory: up to {cfg.max_cached_in_memory}")
 
     # ---------- Model ----------
     model = EvolutionTrainingModule(
@@ -382,44 +346,39 @@ def train(raw_config_path: str, args: list[str]) -> None:
     )
 
     if cfg.pretrained and not cfg.resume:
-        print(f"Loading pretrained evolution weights from {cfg.pretrained}")
+        print(f"Loading pretrained weights from {cfg.pretrained}")
         ckpt = torch.load(cfg.pretrained, map_location="cpu", weights_only=False)
         state = ckpt.get("state_dict", ckpt)
         model.load_state_dict(state, strict=False)
 
     # ---------- Callbacks ----------
-    callbacks = []
     mc = ModelCheckpoint(
         dirpath=os.path.join(cfg.output, "checkpoints"),
-        filename="evolution-{epoch:03d}-{step}-{val/loss:.4f}",
+        filename="evolution-{epoch:03d}-{step}",
         monitor="val/loss" if val_loader else "train/loss",
-        save_top_k=cfg.save_top_k,
-        save_last=True,
-        mode="min",
+        save_top_k=cfg.save_top_k, save_last=True, mode="min",
         every_n_epochs=1,
     )
-    callbacks.append(mc)
 
     # ---------- Logger ----------
     loggers = []
     wandb_cfg = cfg.wandb if not cfg.debug else None
     if wandb_cfg:
-        wdb_logger = WandbLogger(
+        wdb = WandbLogger(
             name=wandb_cfg.get("name", "evolution"),
             save_dir=cfg.output,
             project=wandb_cfg.get("project", "boltz-evolution"),
             entity=wandb_cfg.get("entity", None),
             log_model=False,
         )
-        loggers.append(wdb_logger)
+        loggers.append(wdb)
 
         @rank_zero_only
-        def save_config():
-            config_out = Path(wdb_logger.experiment.dir) / "evolution_config.yaml"
-            omegaconf.OmegaConf.save(raw_config, config_out)
-            wdb_logger.experiment.save(str(config_out))
-
-        save_config()
+        def _save_cfg():
+            p = Path(wdb.experiment.dir) / "evolution_config.yaml"
+            omegaconf.OmegaConf.save(raw_config, p)
+            wdb.experiment.save(str(p))
+        _save_cfg()
 
     # ---------- Trainer ----------
     trainer_kwargs = dict(cfg.trainer)
@@ -428,28 +387,23 @@ def train(raw_config_path: str, args: list[str]) -> None:
         devices = 1
 
     strategy = "auto"
-    if isinstance(devices, int) and devices > 1:
-        strategy = DDPStrategy(find_unused_parameters=False)
-    elif isinstance(devices, list) and len(devices) > 1:
+    if isinstance(devices, (int, list)) and (
+        (isinstance(devices, int) and devices > 1) or
+        (isinstance(devices, list) and len(devices) > 1)
+    ):
         strategy = DDPStrategy(find_unused_parameters=False)
 
     trainer = pl.Trainer(
         default_root_dir=cfg.output,
-        devices=devices,
-        strategy=strategy,
-        callbacks=callbacks,
-        logger=loggers,
+        devices=devices, strategy=strategy,
+        callbacks=[mc], logger=loggers,
         enable_checkpointing=True,
         **trainer_kwargs,
     )
 
     # ---------- Train ----------
-    trainer.fit(
-        model,
-        train_dataloaders=train_loader,
-        val_dataloaders=val_loader,
-        ckpt_path=cfg.resume,
-    )
+    trainer.fit(model, train_dataloaders=train_loader,
+                val_dataloaders=val_loader, ckpt_path=cfg.resume)
 
 
 if __name__ == "__main__":
