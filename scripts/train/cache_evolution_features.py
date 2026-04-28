@@ -41,6 +41,23 @@ from boltz.model.models.boltz2 import Boltz2
 FEAT_KEYS = ["token_pad_mask", "token_to_rep_atom", "mol_type", "affinity_token_mask"]
 
 
+def _get_total_seq_len(yaml_path: Path) -> int:
+    """Read a YAML input file and return total sequence length across all chains."""
+    import yaml
+    try:
+        with open(yaml_path) as f:
+            data = yaml.safe_load(f)
+        total = 0
+        for entry in data.get("sequences", []):
+            for entity_type, info in entry.items():
+                seq = info.get("sequence", "")
+                if seq:
+                    total += len(seq)
+        return total
+    except Exception:
+        return None
+
+
 class EvolutionCacheWriter(BasePredictionWriter):
     """Saves trunk representations to .pt files during prediction."""
 
@@ -127,6 +144,12 @@ def main():
     parser.add_argument("--skip_diffusion", action="store_true",
                         help="Skip diffusion sampling and use ground truth coords as x_pred. "
                         "Much faster (~2x) when you have experimental structures.")
+    parser.add_argument("--max_total_tokens", type=int, default=None,
+                        help="Skip complexes where len(seq_A) + len(seq_B) exceeds this. "
+                        "Useful to avoid OOM on long sequences. Default: no limit.")
+    parser.add_argument("--max_complexes", type=int, default=None,
+                        help="Only cache the first N complexes (after filtering). "
+                        "Useful for testing. Default: no limit.")
     args = parser.parse_args()
 
     data_path = Path(args.data)
@@ -141,12 +164,33 @@ def main():
         print(f"ERROR: Molecule data not found at {mol_dir}")
         sys.exit(1)
 
-    # ---- Step 1: Process inputs (same as boltz predict) ----
+    # ---- Step 1: Discover and filter inputs ----
     input_paths = check_inputs(data_path)
     if not input_paths:
         print(f"ERROR: No YAML/FASTA files found in {data_path}")
         sys.exit(1)
     print(f"Found {len(input_paths)} input files")
+
+    if args.max_total_tokens is not None:
+        filtered = []
+        skipped = 0
+        for p in input_paths:
+            total_len = _get_total_seq_len(p)
+            if total_len is not None and total_len <= args.max_total_tokens:
+                filtered.append(p)
+            else:
+                skipped += 1
+        input_paths = filtered
+        print(f"  After token filter (<= {args.max_total_tokens}): "
+              f"{len(input_paths)} kept, {skipped} skipped")
+
+    if args.max_complexes is not None and len(input_paths) > args.max_complexes:
+        input_paths = input_paths[:args.max_complexes]
+        print(f"  Truncated to first {args.max_complexes} complexes")
+
+    if not input_paths:
+        print("ERROR: No inputs remain after filtering.")
+        sys.exit(1)
 
     ccd_path = cache / "ccd.pkl"
     process_inputs(
