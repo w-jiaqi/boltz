@@ -15,7 +15,9 @@ Usage:
 """
 
 import argparse
+import os
 import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
@@ -23,6 +25,7 @@ from typing import Optional
 import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import BasePredictionWriter
+from pytorch_lightning.strategies import DDPStrategy
 
 from boltz.data.module.inferencev2 import Boltz2InferenceDataModule
 from boltz.data.types import Manifest
@@ -135,7 +138,12 @@ def main():
     parser.add_argument("--recycling_steps", type=int, default=10)
     parser.add_argument("--sampling_steps", type=int, default=200)
     parser.add_argument("--diffusion_samples", type=int, default=1)
-    parser.add_argument("--devices", type=int, default=1)
+    parser.add_argument("--devices", type=int, default=-1,
+                        help="Number of GPUs/devices. -1 (default) auto-detects all "
+                        "visible GPUs (e.g. via CUDA_VISIBLE_DEVICES / SLURM --gres). "
+                        "When >1, runs DDP and shards the manifest across ranks.")
+    parser.add_argument("--num_nodes", type=int, default=1,
+                        help="Number of nodes for multi-node DDP. Default: 1.")
     parser.add_argument("--accelerator", default="gpu")
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--no_half", action="store_true", help="Save in float32")
@@ -164,50 +172,83 @@ def main():
         print(f"ERROR: Molecule data not found at {mol_dir}")
         sys.exit(1)
 
-    # ---- Step 1: Discover and filter inputs ----
-    input_paths = check_inputs(data_path)
-    if not input_paths:
-        print(f"ERROR: No YAML/FASTA files found in {data_path}")
-        sys.exit(1)
-    print(f"Found {len(input_paths)} input files")
+    # ---- Resolve device count and DDP topology ----
+    if args.devices < 0:
+        if args.accelerator == "gpu":
+            n_devices = max(1, torch.cuda.device_count())
+        else:
+            n_devices = 1
+    else:
+        n_devices = args.devices
+    is_distributed = n_devices > 1 or args.num_nodes > 1
 
-    if args.max_total_tokens is not None:
-        filtered = []
-        skipped = 0
-        for p in input_paths:
-            total_len = _get_total_seq_len(p)
-            if total_len is not None and total_len <= args.max_total_tokens:
-                filtered.append(p)
-            else:
-                skipped += 1
-        input_paths = filtered
-        print(f"  After token filter (<= {args.max_total_tokens}): "
-              f"{len(input_paths)} kept, {skipped} skipped")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    node_rank = int(os.environ.get("NODE_RANK", 0))
+    is_rank_zero = local_rank == 0 and node_rank == 0
 
-    if args.max_complexes is not None and len(input_paths) > args.max_complexes:
-        input_paths = input_paths[:args.max_complexes]
-        print(f"  Truncated to first {args.max_complexes} complexes")
+    rank_tag = f"[rank {node_rank}.{local_rank}]" if is_distributed else ""
 
-    if not input_paths:
-        print("ERROR: No inputs remain after filtering.")
-        sys.exit(1)
+    # ---- Step 1: Discover, filter, process inputs (rank 0 only under DDP) ----
+    # process_inputs hits the MSA server; we only want one rank doing that.
+    # Other ranks wait until the manifest is on disk before continuing.
+    manifest_path = out_dir / "processed" / "manifest.json"
 
-    ccd_path = cache / "ccd.pkl"
-    process_inputs(
-        data=input_paths,
-        out_dir=out_dir,
-        ccd_path=ccd_path,
-        mol_dir=mol_dir,
-        use_msa_server=args.use_msa_server,
-        msa_server_url="https://api.colabfold.com",
-        msa_pairing_strategy="greedy",
-        max_msa_seqs=4096,
-        boltz2=True,
-    )
+    if is_rank_zero:
+        if manifest_path.exists():
+            print(f"Reusing existing manifest at {manifest_path}")
+        else:
+            input_paths = check_inputs(data_path)
+            if not input_paths:
+                print(f"ERROR: No YAML/FASTA files found in {data_path}")
+                sys.exit(1)
+            print(f"Found {len(input_paths)} input files")
 
-    # Load manifest (same as boltz predict line 1180)
-    manifest = Manifest.load(out_dir / "processed" / "manifest.json")
-    print(f"Manifest has {len(manifest.records)} records")
+            if args.max_total_tokens is not None:
+                filtered = []
+                skipped = 0
+                for p in input_paths:
+                    total_len = _get_total_seq_len(p)
+                    if total_len is not None and total_len <= args.max_total_tokens:
+                        filtered.append(p)
+                    else:
+                        skipped += 1
+                input_paths = filtered
+                print(f"  After token filter (<= {args.max_total_tokens}): "
+                      f"{len(input_paths)} kept, {skipped} skipped")
+
+            if args.max_complexes is not None and len(input_paths) > args.max_complexes:
+                input_paths = input_paths[:args.max_complexes]
+                print(f"  Truncated to first {args.max_complexes} complexes")
+
+            if not input_paths:
+                print("ERROR: No inputs remain after filtering.")
+                sys.exit(1)
+
+            ccd_path = cache / "ccd.pkl"
+            process_inputs(
+                data=input_paths,
+                out_dir=out_dir,
+                ccd_path=ccd_path,
+                mol_dir=mol_dir,
+                use_msa_server=args.use_msa_server,
+                msa_server_url="https://api.colabfold.com",
+                msa_pairing_strategy="greedy",
+                max_msa_seqs=4096,
+                boltz2=True,
+            )
+    else:
+        print(f"{rank_tag} waiting for manifest at {manifest_path} ...")
+        waited = 0
+        while not manifest_path.exists():
+            time.sleep(10)
+            waited += 10
+            if waited > 7200:  # 2 hours
+                print(f"{rank_tag} timed out waiting for manifest.")
+                sys.exit(1)
+        time.sleep(5)  # grace period so the file is fully flushed
+
+    manifest = Manifest.load(manifest_path)
+    print(f"{rank_tag} Manifest has {len(manifest.records)} records")
 
     # Build processed input paths (same as boltz predict lines 1190-1208)
     processed_dir = out_dir / "processed"
@@ -289,20 +330,29 @@ def main():
         skip_diffusion=args.skip_diffusion,
     )
 
+    strategy = "auto"
+    if is_distributed:
+        strategy = DDPStrategy(find_unused_parameters=False)
+
     trainer = pl.Trainer(
         accelerator=args.accelerator,
-        devices=args.devices,
+        devices=n_devices,
+        num_nodes=args.num_nodes,
+        strategy=strategy,
         callbacks=[cache_writer],
         logger=False,
         enable_checkpointing=False,
         precision="bf16-mixed",
+        use_distributed_sampler=True,
     )
 
-    print(f"\nCaching representations to {out_dir} ...")
+    print(f"\n{rank_tag} Caching representations to {out_dir} "
+          f"(devices={n_devices}, nodes={args.num_nodes}) ...")
     trainer.predict(model, datamodule=data_module, return_predictions=False)
 
-    n_cached = len(list(out_dir.glob("*.pt")))
-    print(f"\nDone. Cached {n_cached} complexes to {out_dir}")
+    if trainer.is_global_zero:
+        n_cached = len(list(out_dir.glob("*.pt")))
+        print(f"\nDone. Cached {n_cached} complexes to {out_dir}")
 
 
 if __name__ == "__main__":
