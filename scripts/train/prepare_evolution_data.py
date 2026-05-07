@@ -69,6 +69,12 @@ def main():
     parser.add_argument("--max_seq_len", type=int, default=300,
                         help="Max sequence length per chain. Rows where ANY of the "
                         "4 chains exceeds this are excluded. Default: 300")
+    parser.add_argument("--max_total_tokens", type=int, default=None,
+                        help="Max sum (seq_A + seq_B) per complex. Pairs whose "
+                        "preferred or dispreferred complex exceeds this are "
+                        "dropped, and only complexes within budget get YAMLs. "
+                        "Set this to match the limit applied downstream so the "
+                        "pairs CSV stays consistent with the cache. Default: no limit.")
     parser.add_argument("--val_fraction", type=float, default=0.1,
                         help="Fraction of interaction groups held out for validation. "
                         "Split is by group to prevent protein leakage. Default: 0.1")
@@ -205,6 +211,33 @@ def main():
     print(f"  Unique complexes: {len(complexes)}")
     print(f"  Training pairs:   {len(train_pairs)}")
     print(f"  Validation pairs: {len(val_pairs)}")
+
+    # ---- Apply token-sum filter (must match downstream cache filter) ----
+    if args.max_total_tokens is not None:
+        valid_cids = {
+            cid for cid, (sa, sb) in complexes.items()
+            if len(sa) + len(sb) <= args.max_total_tokens
+        }
+        n_cx_before = len(complexes)
+        n_train_before = len(train_pairs)
+        n_val_before = len(val_pairs)
+        complexes = {cid: c for cid, c in complexes.items() if cid in valid_cids}
+        train_pairs = [
+            p for p in train_pairs
+            if p["preferred"] in valid_cids and p["dispreferred"] in valid_cids
+        ]
+        val_pairs = [
+            p for p in val_pairs
+            if p["preferred"] in valid_cids and p["dispreferred"] in valid_cids
+        ]
+        print(f"\nApplied max_total_tokens={args.max_total_tokens} filter:")
+        print(f"  Complexes:        {n_cx_before} -> {len(complexes)}")
+        print(f"  Training pairs:   {n_train_before} -> {len(train_pairs)}")
+        print(f"  Validation pairs: {n_val_before} -> {len(val_pairs)}")
+
+    if not train_pairs:
+        print("ERROR: No training pairs survive filtering.")
+        sys.exit(1)
 
     # ---- Write YAML files ----
     print(f"\nWriting {len(complexes)} YAML files to {structures_dir}/ ...")

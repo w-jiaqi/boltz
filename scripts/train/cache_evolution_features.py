@@ -1,26 +1,29 @@
 """Cache trunk representations for evolution head training.
 
-Runs Boltz2 inference on input structures and saves the intermediate
-representations needed by the EvolutionModule. Uses the EXACT same
-model loading and data pipeline as `boltz predict`.
+COMMAND 3 of the evolution training pipeline.
+
+Loads the manifest produced by ``build_manifest.py``, runs Boltz2 inference
+across all GPUs (DDP-sharded), and writes one ``.pt`` cache file per
+complex containing the intermediate representations needed by the
+EvolutionModule. Uses the EXACT same model loading and data pipeline as
+``boltz predict``.
+
+Prerequisite:
+    {output}/processed/manifest.json must already exist (created by
+    build_manifest.py). This script does NOT call the MSA server.
 
 Usage:
-    python scripts/train/cache_evolution_features.py \
-        --data /path/to/structures/ \
-        --output /path/to/cache/ \
-        --checkpoint /path/to/boltz2_conf.ckpt \
-        --cache /path/to/boltz_cache \
-        --use_msa_server \
+    python scripts/train/cache_evolution_features.py \\
+        --output /path/to/cache/ \\
+        --checkpoint /path/to/boltz2_conf.ckpt \\
+        --cache /path/to/boltz_cache \\
         --no_kernels
 """
 
 import argparse
-import os
 import sys
-import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Optional
 
 import pytorch_lightning as pl
 import torch
@@ -35,30 +38,11 @@ from boltz.main import (
     BoltzSteeringParams,
     MSAModuleArgs,
     PairformerArgsV2,
-    check_inputs,
-    process_inputs,
 )
 from boltz.model.models.boltz2 import Boltz2
 
 
 FEAT_KEYS = ["token_pad_mask", "token_to_rep_atom", "mol_type", "affinity_token_mask"]
-
-
-def _get_total_seq_len(yaml_path: Path) -> int:
-    """Read a YAML input file and return total sequence length across all chains."""
-    import yaml
-    try:
-        with open(yaml_path) as f:
-            data = yaml.safe_load(f)
-        total = 0
-        for entry in data.get("sequences", []):
-            for entity_type, info in entry.items():
-                seq = info.get("sequence", "")
-                if seq:
-                    total += len(seq)
-        return total
-    except Exception:
-        return None
 
 
 class EvolutionCacheWriter(BasePredictionWriter):
@@ -131,10 +115,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Cache Boltz2 trunk representations for evolution head training."
     )
-    parser.add_argument("--data", required=True, help="Input structures (YAML/FASTA dir or file)")
-    parser.add_argument("--output", required=True, help="Output directory for cached .pt files")
+    parser.add_argument("--output", required=True,
+                        help="Cache root. Reads {output}/processed/manifest.json, "
+                        "writes {output}/<record_id>.pt files.")
     parser.add_argument("--checkpoint", required=True, help="Path to boltz2_conf.ckpt")
-    parser.add_argument("--cache", default="~/.boltz", help="Boltz cache directory (CCD/mols)")
+    parser.add_argument("--cache", default="~/.boltz",
+                        help="Boltz cache directory (CCD/mols). Default: ~/.boltz")
     parser.add_argument("--recycling_steps", type=int, default=10)
     parser.add_argument("--sampling_steps", type=int, default=200)
     parser.add_argument("--diffusion_samples", type=int, default=1)
@@ -147,20 +133,16 @@ def main():
     parser.add_argument("--accelerator", default="gpu")
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--no_half", action="store_true", help="Save in float32")
-    parser.add_argument("--use_msa_server", action="store_true")
     parser.add_argument("--no_kernels", action="store_true")
     parser.add_argument("--skip_diffusion", action="store_true",
                         help="Skip diffusion sampling and use ground truth coords as x_pred. "
                         "Much faster (~2x) when you have experimental structures.")
-    parser.add_argument("--max_total_tokens", type=int, default=None,
-                        help="Skip complexes where len(seq_A) + len(seq_B) exceeds this. "
-                        "Useful to avoid OOM on long sequences. Default: no limit.")
     parser.add_argument("--max_complexes", type=int, default=None,
-                        help="Only cache the first N complexes (after filtering). "
-                        "Useful for testing. Default: no limit.")
+                        help="Only cache the first N records from the manifest. "
+                        "Useful for sanity checks without rebuilding the manifest. "
+                        "Default: cache everything in the manifest.")
     args = parser.parse_args()
 
-    data_path = Path(args.data)
     out_dir = Path(args.output)
     cache = Path(args.cache).expanduser()
     checkpoint = Path(args.checkpoint)
@@ -172,7 +154,12 @@ def main():
         print(f"ERROR: Molecule data not found at {mol_dir}")
         sys.exit(1)
 
-    # ---- Resolve device count and DDP topology ----
+    manifest_path = out_dir / "processed" / "manifest.json"
+    if not manifest_path.exists():
+        print(f"ERROR: Manifest not found at {manifest_path}")
+        print("Run build_manifest.py first to generate it.")
+        sys.exit(1)
+
     if args.devices < 0:
         if args.accelerator == "gpu":
             n_devices = max(1, torch.cuda.device_count())
@@ -182,75 +169,13 @@ def main():
         n_devices = args.devices
     is_distributed = n_devices > 1 or args.num_nodes > 1
 
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    node_rank = int(os.environ.get("NODE_RANK", 0))
-    is_rank_zero = local_rank == 0 and node_rank == 0
-
-    rank_tag = f"[rank {node_rank}.{local_rank}]" if is_distributed else ""
-
-    # ---- Step 1: Discover, filter, process inputs (rank 0 only under DDP) ----
-    # process_inputs hits the MSA server; we only want one rank doing that.
-    # Other ranks wait until the manifest is on disk before continuing.
-    manifest_path = out_dir / "processed" / "manifest.json"
-
-    if is_rank_zero:
-        if manifest_path.exists():
-            print(f"Reusing existing manifest at {manifest_path}")
-        else:
-            input_paths = check_inputs(data_path)
-            if not input_paths:
-                print(f"ERROR: No YAML/FASTA files found in {data_path}")
-                sys.exit(1)
-            print(f"Found {len(input_paths)} input files")
-
-            if args.max_total_tokens is not None:
-                filtered = []
-                skipped = 0
-                for p in input_paths:
-                    total_len = _get_total_seq_len(p)
-                    if total_len is not None and total_len <= args.max_total_tokens:
-                        filtered.append(p)
-                    else:
-                        skipped += 1
-                input_paths = filtered
-                print(f"  After token filter (<= {args.max_total_tokens}): "
-                      f"{len(input_paths)} kept, {skipped} skipped")
-
-            if args.max_complexes is not None and len(input_paths) > args.max_complexes:
-                input_paths = input_paths[:args.max_complexes]
-                print(f"  Truncated to first {args.max_complexes} complexes")
-
-            if not input_paths:
-                print("ERROR: No inputs remain after filtering.")
-                sys.exit(1)
-
-            ccd_path = cache / "ccd.pkl"
-            process_inputs(
-                data=input_paths,
-                out_dir=out_dir,
-                ccd_path=ccd_path,
-                mol_dir=mol_dir,
-                use_msa_server=args.use_msa_server,
-                msa_server_url="https://api.colabfold.com",
-                msa_pairing_strategy="greedy",
-                max_msa_seqs=4096,
-                boltz2=True,
-            )
-    else:
-        print(f"{rank_tag} waiting for manifest at {manifest_path} ...")
-        waited = 0
-        while not manifest_path.exists():
-            time.sleep(10)
-            waited += 10
-            if waited > 7200:  # 2 hours
-                print(f"{rank_tag} timed out waiting for manifest.")
-                sys.exit(1)
-        time.sleep(5)  # grace period so the file is fully flushed
-
     manifest = Manifest.load(manifest_path)
-    print(f"{rank_tag} Manifest has {len(manifest.records)} records")
+    print(f"Manifest has {len(manifest.records)} records")
 
-    # Build processed input paths (same as boltz predict lines 1190-1208)
+    if args.max_complexes is not None and len(manifest.records) > args.max_complexes:
+        manifest = Manifest(manifest.records[:args.max_complexes])
+        print(f"Truncated manifest to first {args.max_complexes} records (debug)")
+
     processed_dir = out_dir / "processed"
     processed = BoltzProcessedInput(
         manifest=manifest,
@@ -271,7 +196,6 @@ def main():
         ),
     )
 
-    # ---- Step 2: Load model (same as boltz predict lines 1228-1326) ----
     diffusion_params = Boltz2DiffusionParams()
     diffusion_params.step_scale = 1.5
     pairformer_args = PairformerArgsV2()
@@ -311,7 +235,6 @@ def main():
     model = Boltz2.load_from_checkpoint(str(checkpoint), **load_kwargs)
     model.eval()
 
-    # ---- Step 3: Create data module (same as boltz predict lines 1271-1282) ----
     data_module = Boltz2InferenceDataModule(
         manifest=processed.manifest,
         target_dir=processed.targets_dir,
@@ -323,7 +246,6 @@ def main():
         extra_mols_dir=processed.extra_mols_dir,
     )
 
-    # ---- Step 4: Run prediction with cache writer ----
     cache_writer = EvolutionCacheWriter(
         output_dir=str(out_dir),
         save_half=not args.no_half,
@@ -346,7 +268,7 @@ def main():
         use_distributed_sampler=True,
     )
 
-    print(f"\n{rank_tag} Caching representations to {out_dir} "
+    print(f"\nCaching representations to {out_dir} "
           f"(devices={n_devices}, nodes={args.num_nodes}) ...")
     trainer.predict(model, datamodule=data_module, return_predictions=False)
 

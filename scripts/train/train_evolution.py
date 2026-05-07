@@ -99,24 +99,46 @@ class PairedEvolutionDataset(Dataset):
     the shared CachedComplexStore, plus evolutionary distances.
     """
 
-    def __init__(self, store: CachedComplexStore, pairs_csv: str):
+    def __init__(self, store: CachedComplexStore, pairs_csv: str, strict: bool = False):
         self.store = store
-        self.pairs = []
+        raw_pairs = []
         with open(pairs_csv) as f:
             for row in csv.DictReader(f):
-                self.pairs.append(row)
+                raw_pairs.append(row)
 
         referenced_ids = set()
-        for row in self.pairs:
+        for row in raw_pairs:
             referenced_ids.add(row["preferred"])
             referenced_ids.add(row["dispreferred"])
         missing = self.store.validate(referenced_ids)
-        if missing:
-            n = len(missing)
-            examples = missing[:5]
+
+        if missing and strict:
             raise FileNotFoundError(
-                f"{n} cached .pt files missing. First 5: {examples}\n"
-                f"Run cache_evolution_features.py first."
+                f"{len(missing)} cached .pt files missing. First 5: {missing[:5]}\n"
+                f"Run cache_evolution_features.py to (re)build them, "
+                f"or pass strict=False to drop the affected pairs."
+            )
+
+        if missing:
+            missing_set = set(missing)
+            kept = [
+                row for row in raw_pairs
+                if row["preferred"] not in missing_set
+                and row["dispreferred"] not in missing_set
+            ]
+            print(
+                f"WARNING: {len(missing)} of {len(referenced_ids)} complexes missing "
+                f"from cache; dropped {len(raw_pairs) - len(kept)} of {len(raw_pairs)} "
+                f"pairs. First 3 missing: {missing[:3]}"
+            )
+            self.pairs = kept
+        else:
+            self.pairs = raw_pairs
+
+        if not self.pairs:
+            raise RuntimeError(
+                f"No usable pairs after filtering against cache. "
+                f"Cache likely empty or unrelated to {pairs_csv}."
             )
 
     def __len__(self):
