@@ -33,6 +33,8 @@ import argparse
 import sys
 from pathlib import Path
 
+from rdkit import Chem
+
 from boltz.main import check_inputs, process_inputs
 
 
@@ -120,6 +122,11 @@ def main():
     if not input_paths:
         print("ERROR: No inputs remain after filtering.")
         sys.exit(1)
+
+    # Required: without this, multiprocessing.Pool workers receive Mol objects
+    # with all atom-level properties stripped (RDKit's default pickle behavior),
+    # and parse_polymer crashes with KeyError: 'name'.
+    Chem.SetDefaultPickleProperties(Chem.PropertyPickleOptions.AllProps)
 
     ccd_path = cache / "ccd.pkl"
     process_inputs(
