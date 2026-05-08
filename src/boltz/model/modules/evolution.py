@@ -225,6 +225,11 @@ class EvolutionHeads(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
+        # Energies start at exactly 0 → BT loss starts at log(2), margin loss
+        # is well-behaved at step 0. Without this, default Kaiming-uniform init
+        # gives arbitrary nonzero starting energies that can flip ranking signs.
+        init.final_init_(self.to_evo_energy[-1].weight)
+        init.bias_init_zero_(self.to_evo_energy[-1].bias)
 
     def forward(self, z, feats, multiplicity=1, use_interface_mask=False):
         pad_token_mask = (

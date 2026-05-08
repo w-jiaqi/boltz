@@ -267,10 +267,21 @@ class EvolutionTrainingModule(pl.LightningModule):
         )
 
         sched_type = self.training_args.get("lr_scheduler", None)
+
+        # If T_max is null/auto, derive it from the trainer so cosine decay
+        # spans the full run regardless of dataset size.
+        cfg_t_max = self.training_args.get("lr_cosine_T_max", None)
+        if cfg_t_max in (None, "auto"):
+            total_steps = int(self.trainer.estimated_stepping_batches)
+            warmup_steps = self.training_args.get("lr_warmup_steps", 1000)
+            t_max = max(1, total_steps - warmup_steps)
+        else:
+            t_max = int(cfg_t_max)
+
         if sched_type == "cosine":
             sched = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
-                T_max=self.training_args.get("lr_cosine_T_max", 50000),
+                T_max=t_max,
                 eta_min=self.training_args.get("lr_min", 1e-6),
             )
             return [optimizer], [{"scheduler": sched, "interval": "step"}]
@@ -280,7 +291,7 @@ class EvolutionTrainingModule(pl.LightningModule):
             warmup = LinearLR(optimizer, start_factor=1e-3, total_iters=warmup_steps)
             cosine = CosineAnnealingLR(
                 optimizer,
-                T_max=self.training_args.get("lr_cosine_T_max", 50000),
+                T_max=t_max,
                 eta_min=self.training_args.get("lr_min", 1e-6),
             )
             sched = SequentialLR(optimizer, [warmup, cosine], milestones=[warmup_steps])
