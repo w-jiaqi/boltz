@@ -1,25 +1,70 @@
-"""Prepare evolution training data from the HuggingFace evo dataset.
+"""Prepare evolution training data from the HuggingFace evo-final dataset.
 
 COMMAND 1 of the evolution training pipeline.
 
-Downloads wjiaqi/evo, filters by sequence length, deduplicates complexes,
-generates YAML files for Boltz2 caching, and creates train/val pair CSVs.
+Downloads wjiaqi/evo-final (subset `swap_complexes`), filters by sequence
+length, deduplicates complexes, generates YAML files for Boltz2 caching, and
+creates train/val/test pair CSVs.
 
 After this, run cache_evolution_features.py on the structures/ dir to
 produce cached .pt files, then train with train_evolution.py.
+
+Dataset layout (wjiaqi/evo-final, subset `swap_complexes`)
+----------------------------------------------------------
+Three pre-built splits: ``train`` / ``validation`` / ``test`` (already
+separated by ``interaction_group_id`` so there is no protein leakage — we
+use them as-is rather than re-splitting). Each row describes one conserved
+interaction observed in two species and carries, among others:
+    protein_{A,B}_sp{1,2}_{uniprot,seq,len}
+    seq_identity_A, seq_identity_B   (identity of the orthologous chain
+                                      between the two species)
+    divergence_mya                   (phylogenetic distance between the two
+                                      species, in millions of years)
+
+Pair construction (4 preference pairs per row)
+----------------------------------------------
+The two native complexes are (A_sp1, B_sp1) and (A_sp2, B_sp2). Mixing the
+chains across species yields the two swap complexes (A_sp1, B_sp2) and
+(A_sp2, B_sp1). From these 4 complexes we emit 4 native-vs-swap pairs — two
+that swap chain B and two that swap chain A — mirroring the AB/BA crossovers
+in the dataset's own `preference_pairs` subset (which has exactly 4x the rows
+of `swap_complexes`).
+
+Distance label
+--------------
+The dispreferred (swap) complex is given an evolutionary-distance label that
+is a weighted blend of two normalized signals. We DO NOT bake the weights in
+here — instead we emit the two normalized components per pair and let
+train_evolution.py combine them with config-tunable weights:
+
+    div_norm = log1p(divergence_mya) / log1p(D_max)          in [0, 1]
+    seq_norm = minmax(1 - seq_identity_<swapped chain>)       in [0, 1]
+
+    dist_dispreferred = w_div * div_norm + w_seq * seq_norm   (computed at
+                                                               train time)
+    dist_preferred    = 0.0                                   (native anchor)
+
+Normalization constants (D_max, the seq min/max) are fit on the TRAIN split
+only and reused for val/test so there is no leakage. They are recorded in
+stats.txt and norm_params.json for reproducibility.
 
 Usage:
     python scripts/train/prepare_evolution_data.py \
         --output /path/to/evolution_data/ \
         --max_seq_len 300 \
-        --val_fraction 0.1
+        --max_total_tokens 400
 
 Output:
     evolution_data/
     ├── structures/           # YAML files for Boltz2 (one per unique complex)
-    ├── train_pairs.csv       # Bradley-Terry training pairs
-    ├── val_pairs.csv         # Validation pairs
+    ├── train_pairs.csv       # preference pairs (train split)
+    ├── val_pairs.csv         # preference pairs (validation split)
+    ├── test_pairs.csv        # preference pairs (test split)
+    ├── norm_params.json      # distance-normalization constants
     └── stats.txt             # Summary statistics
+
+Pair CSV columns:
+    preferred, dispreferred, swapped_chain, div_norm, seq_norm
 
 Next step:
     python cache_evolution_features.py \\
@@ -31,10 +76,16 @@ Next step:
 import argparse
 import csv
 import json
+import math
 import sys
 from pathlib import Path
 
 import numpy as np
+
+DATASET = "wjiaqi/evo-final"
+SUBSET = "swap_complexes"
+# HuggingFace split name -> output CSV stem.
+SPLITS = {"train": "train_pairs", "validation": "val_pairs", "test": "test_pairs"}
 
 
 def complex_id(uniprot_a: str, uniprot_b: str) -> str:
@@ -62,7 +113,7 @@ def write_yaml(path: Path, seq_a: str, seq_b: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Prepare evolution training data from wjiaqi/evo dataset."
+        description=f"Prepare evolution training data from {DATASET} ({SUBSET})."
     )
     parser.add_argument("--output", required=True,
                         help="Output directory. Will contain structures/, CSVs, etc.")
@@ -75,14 +126,11 @@ def main():
                         "dropped, and only complexes within budget get YAMLs. "
                         "Set this to match the limit applied downstream so the "
                         "pairs CSV stays consistent with the cache. Default: no limit.")
-    parser.add_argument("--val_fraction", type=float, default=0.1,
-                        help="Fraction of interaction groups held out for validation. "
-                        "Split is by group to prevent protein leakage. Default: 0.1")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for train/val split. Default: 42")
-    parser.add_argument("--null_identity", type=float, default=0.0,
-                        help="Value for null seq_identity (~5%% of rows where proteins "
-                        "are too divergent for MMseqs2 alignment). Default: 0.0")
+    parser.add_argument("--null_identity", type=float, default=1.0,
+                        help="Identity value to assume when seq_identity_A/B is "
+                        "missing (treated as identical => no sequence signal). "
+                        "The new dataset has no nulls; this is a safety net. "
+                        "Default: 1.0")
     args = parser.parse_args()
 
     out_dir = Path(args.output)
@@ -90,60 +138,87 @@ def main():
     structures_dir = out_dir / "structures"
     structures_dir.mkdir(exist_ok=True)
 
-    # ---- Load dataset ----
-    print("Loading dataset from HuggingFace (wjiaqi/evo)...")
+    # ---- Load dataset (all three pre-built splits) ----
+    print(f"Loading dataset from HuggingFace ({DATASET}, subset={SUBSET})...")
     try:
         from datasets import load_dataset
     except ImportError:
         print("ERROR: `datasets` package not installed. Run: pip install datasets")
         sys.exit(1)
 
-    ds = load_dataset("wjiaqi/evo", split="train")
-    total_rows = len(ds)
-    print(f"  Loaded {total_rows} rows")
+    ds = load_dataset(DATASET, SUBSET)
+    missing_splits = [s for s in SPLITS if s not in ds]
+    if missing_splits:
+        print(f"ERROR: dataset is missing expected splits {missing_splits}. "
+              f"Available: {list(ds.keys())}")
+        sys.exit(1)
 
-    # ---- Filter by sequence length ----
+    total_rows = {s: len(ds[s]) for s in SPLITS}
+    print(f"  Loaded splits: " + ", ".join(f"{s}={n}" for s, n in total_rows.items()))
+
+    # ---- Filter by sequence length (per split) ----
     max_len = args.max_seq_len
     print(f"\nFiltering: all 4 chains must be <= {max_len} aa...")
 
-    kept_rows = []
-    for row in ds:
+    def length_ok(row):
         lens = [
             row["protein_A_sp1_len"], row["protein_B_sp1_len"],
             row["protein_A_sp2_len"], row["protein_B_sp2_len"],
         ]
-        if all(l <= max_len for l in lens):
-            kept_rows.append(row)
+        return all(l <= max_len for l in lens)
 
-    print(f"  Kept {len(kept_rows)} / {total_rows} rows "
-          f"({100 * len(kept_rows) / total_rows:.1f}%)")
+    kept = {}
+    for split in SPLITS:
+        kept[split] = [r for r in ds[split] if length_ok(r)]
+        n, tot = len(kept[split]), total_rows[split]
+        print(f"  {split:11s}: kept {n} / {tot} ({100 * n / tot:.1f}%)")
 
-    if not kept_rows:
-        print("ERROR: No rows passed the length filter. Try increasing --max_seq_len.")
+    if not kept["train"]:
+        print("ERROR: No train rows passed the length filter. "
+              "Try increasing --max_seq_len.")
         sys.exit(1)
 
-    # ---- Train/val split by interaction_group_id (prevents data leakage) ----
-    print(f"\nSplitting by interaction_group_id "
-          f"(val_fraction={args.val_fraction})...")
+    # ---- Fit distance-normalization constants on the TRAIN split only ----
+    # div_norm = log1p(divergence_mya) / log1p(D_max)
+    # seq_norm = (x - seq_min) / (seq_max - seq_min), x = 1 - seq_identity_<chain>
+    def _seqid(v):
+        return args.null_identity if v is None else v
 
-    group_ids = sorted(set(row["interaction_group_id"] for row in kept_rows))
-    rng = np.random.default_rng(args.seed)
-    rng.shuffle(group_ids)
+    train_div = [r["divergence_mya"] for r in kept["train"]
+                 if r["divergence_mya"] is not None]
+    d_max = max(train_div) if train_div else 1.0
+    log_d_max = math.log1p(d_max) if d_max > 0 else 1.0
 
-    n_val = max(1, int(len(group_ids) * args.val_fraction))
-    val_groups = set(group_ids[:n_val])
-    train_groups = set(group_ids[n_val:])
+    train_seq_dist = []
+    for r in kept["train"]:
+        train_seq_dist.append(1.0 - _seqid(r["seq_identity_A"]))
+        train_seq_dist.append(1.0 - _seqid(r["seq_identity_B"]))
+    seq_min = min(train_seq_dist)
+    seq_max = max(train_seq_dist)
+    seq_span = (seq_max - seq_min) if seq_max > seq_min else 1.0
 
-    train_rows = [r for r in kept_rows if r["interaction_group_id"] in train_groups]
-    val_rows = [r for r in kept_rows if r["interaction_group_id"] in val_groups]
+    norm_params = {
+        "div": {"transform": "log1p_minmax", "d_max": float(d_max),
+                "log1p_d_max": float(log_d_max)},
+        "seq": {"transform": "minmax_of_1_minus_identity",
+                "seq_dist_min": float(seq_min), "seq_dist_max": float(seq_max)},
+        "fit_on": "train",
+    }
+    (out_dir / "norm_params.json").write_text(json.dumps(norm_params, indent=2) + "\n")
+    print(f"\nDistance normalization (fit on train):")
+    print(f"  divergence: log1p / log1p({d_max:.1f})")
+    print(f"  seq (1-identity): minmax over [{seq_min:.4f}, {seq_max:.4f}]")
 
-    print(f"  Train: {len(train_rows)} rows from {len(train_groups)} groups")
-    print(f"  Val:   {len(val_rows)} rows from {len(val_groups)} groups")
+    def div_norm(divergence):
+        if divergence is None or log_d_max <= 0:
+            return 0.0
+        return round(math.log1p(divergence) / log_d_max, 6)
 
-    # ---- Extract unique complexes ----
-    # Each (uniprot_A, uniprot_B) pair defines one unique complex.
-    # A row produces 4 complexes: 2 native + 2 swaps. Many rows share
-    # the same native complexes, so deduplication is critical.
+    def seq_norm(identity):
+        x = 1.0 - _seqid(identity)
+        return round(min(max((x - seq_min) / seq_span, 0.0), 1.0), 6)
+
+    # ---- Build complexes + preference pairs per split ----
     print("\nExtracting unique complexes and building pairs...")
 
     complexes = {}  # complex_id -> (seq_a, seq_b)
@@ -155,62 +230,59 @@ def main():
         return cid
 
     def build_pairs(rows):
-        """From dataset rows, build Bradley-Terry comparison pairs.
+        """Build 4 native-vs-swap preference pairs per row.
 
-        For each row (one conserved interaction across two species):
-        - Native 1: (A_sp1, B_sp1) — correct in species 1
-        - Native 2: (A_sp2, B_sp2) — correct in species 2
-        - Swap 1:   (A_sp1, B_sp2) — cross-species B swap
-        - Swap 2:   (A_sp2, B_sp1) — cross-species B swap
+        Native complexes : nat1=(A_sp1,B_sp1), nat2=(A_sp2,B_sp2)
+        Swap complexes   : mix1=(A_sp1,B_sp2), mix2=(A_sp2,B_sp1)
 
-        Pairs: native_1 preferred over swap_1,
-               native_2 preferred over swap_2.
-        Distance = 1 - seq_identity_B (how different the swapped B is).
+        Pairs (preferred=native, dispreferred=swap):
+          nat1 vs mix1  -> chain B swapped  (seq_identity_B)
+          nat2 vs mix2  -> chain B swapped  (seq_identity_B)
+          nat1 vs mix2  -> chain A swapped  (seq_identity_A)
+          nat2 vs mix1  -> chain A swapped  (seq_identity_A)
+
+        divergence_mya is per-row (species-pair level) and shared by all 4.
         """
         pairs = []
         for row in rows:
-            sid_b = row["seq_identity_B"]
-            if sid_b is None:
-                sid_b = args.null_identity
-            dist_swap = 1.0 - sid_b
+            dn = div_norm(row["divergence_mya"])
+            sn_a = seq_norm(row["seq_identity_A"])
+            sn_b = seq_norm(row["seq_identity_B"])
 
-            native_1 = register(
+            nat1 = register(
                 row["protein_A_sp1_uniprot"], row["protein_A_sp1_seq"],
                 row["protein_B_sp1_uniprot"], row["protein_B_sp1_seq"],
             )
-            native_2 = register(
+            nat2 = register(
                 row["protein_A_sp2_uniprot"], row["protein_A_sp2_seq"],
                 row["protein_B_sp2_uniprot"], row["protein_B_sp2_seq"],
             )
-            swap_1 = register(
+            mix1 = register(
                 row["protein_A_sp1_uniprot"], row["protein_A_sp1_seq"],
                 row["protein_B_sp2_uniprot"], row["protein_B_sp2_seq"],
             )
-            swap_2 = register(
+            mix2 = register(
                 row["protein_A_sp2_uniprot"], row["protein_A_sp2_seq"],
                 row["protein_B_sp1_uniprot"], row["protein_B_sp1_seq"],
             )
 
-            pairs.append({
-                "preferred": native_1,
-                "dispreferred": swap_1,
-                "dist_preferred": 0.0,
-                "dist_dispreferred": round(dist_swap, 4),
-            })
-            pairs.append({
-                "preferred": native_2,
-                "dispreferred": swap_2,
-                "dist_preferred": 0.0,
-                "dist_dispreferred": round(dist_swap, 4),
-            })
+            # Chain-B swaps (anchor A fixed): label uses seq_identity_B.
+            pairs.append({"preferred": nat1, "dispreferred": mix1,
+                          "swapped_chain": "B", "div_norm": dn, "seq_norm": sn_b})
+            pairs.append({"preferred": nat2, "dispreferred": mix2,
+                          "swapped_chain": "B", "div_norm": dn, "seq_norm": sn_b})
+            # Chain-A swaps (anchor B fixed): label uses seq_identity_A.
+            pairs.append({"preferred": nat1, "dispreferred": mix2,
+                          "swapped_chain": "A", "div_norm": dn, "seq_norm": sn_a})
+            pairs.append({"preferred": nat2, "dispreferred": mix1,
+                          "swapped_chain": "A", "div_norm": dn, "seq_norm": sn_a})
         return pairs
 
-    train_pairs = build_pairs(train_rows)
-    val_pairs = build_pairs(val_rows)
+    pairs_by_split = {s: build_pairs(kept[s]) for s in SPLITS}
 
     print(f"  Unique complexes: {len(complexes)}")
-    print(f"  Training pairs:   {len(train_pairs)}")
-    print(f"  Validation pairs: {len(val_pairs)}")
+    for s in SPLITS:
+        print(f"  {s:11s} pairs: {len(pairs_by_split[s])}")
 
     # ---- Apply token-sum filter (must match downstream cache filter) ----
     if args.max_total_tokens is not None:
@@ -219,23 +291,18 @@ def main():
             if len(sa) + len(sb) <= args.max_total_tokens
         }
         n_cx_before = len(complexes)
-        n_train_before = len(train_pairs)
-        n_val_before = len(val_pairs)
         complexes = {cid: c for cid, c in complexes.items() if cid in valid_cids}
-        train_pairs = [
-            p for p in train_pairs
-            if p["preferred"] in valid_cids and p["dispreferred"] in valid_cids
-        ]
-        val_pairs = [
-            p for p in val_pairs
-            if p["preferred"] in valid_cids and p["dispreferred"] in valid_cids
-        ]
         print(f"\nApplied max_total_tokens={args.max_total_tokens} filter:")
-        print(f"  Complexes:        {n_cx_before} -> {len(complexes)}")
-        print(f"  Training pairs:   {n_train_before} -> {len(train_pairs)}")
-        print(f"  Validation pairs: {n_val_before} -> {len(val_pairs)}")
+        print(f"  Complexes: {n_cx_before} -> {len(complexes)}")
+        for s in SPLITS:
+            before = len(pairs_by_split[s])
+            pairs_by_split[s] = [
+                p for p in pairs_by_split[s]
+                if p["preferred"] in valid_cids and p["dispreferred"] in valid_cids
+            ]
+            print(f"  {s:11s} pairs: {before} -> {len(pairs_by_split[s])}")
 
-    if not train_pairs:
+    if not pairs_by_split["train"]:
         print("ERROR: No training pairs survive filtering.")
         sys.exit(1)
 
@@ -248,7 +315,7 @@ def main():
     print(f"  Done.")
 
     # ---- Write pairs CSVs ----
-    fieldnames = ["preferred", "dispreferred", "dist_preferred", "dist_dispreferred"]
+    fieldnames = ["preferred", "dispreferred", "swapped_chain", "div_norm", "seq_norm"]
 
     def write_csv(path, pairs):
         with open(path, "w", newline="") as f:
@@ -256,25 +323,24 @@ def main():
             w.writeheader()
             w.writerows(pairs)
 
-    train_csv = out_dir / "train_pairs.csv"
-    val_csv = out_dir / "val_pairs.csv"
-    write_csv(train_csv, train_pairs)
-    write_csv(val_csv, val_pairs)
-    print(f"\n  {train_csv}  ({len(train_pairs)} pairs)")
-    print(f"  {val_csv}  ({len(val_pairs)} pairs)")
+    print()
+    for s, stem in SPLITS.items():
+        path = out_dir / f"{stem}.csv"
+        write_csv(path, pairs_by_split[s])
+        print(f"  {path}  ({len(pairs_by_split[s])} pairs)")
 
     # ---- Write statistics ----
     all_lens = [len(s1) + len(s2) for s1, s2 in complexes.values()]
     stats_lines = [
-        f"Source: wjiaqi/evo (HuggingFace)",
-        f"Total rows in dataset: {total_rows}",
+        f"Source: {DATASET} (subset {SUBSET}, HuggingFace)",
+        f"Total rows: " + ", ".join(f"{s}={n}" for s, n in total_rows.items()),
         f"Max sequence length filter: {max_len}",
-        f"Rows after filter: {len(kept_rows)} ({100 * len(kept_rows) / total_rows:.1f}%)",
-        f"Interaction groups (train): {len(train_groups)}",
-        f"Interaction groups (val): {len(val_groups)}",
-        f"Training pairs: {len(train_pairs)}",
-        f"Validation pairs: {len(val_pairs)}",
+        f"Rows after length filter: "
+        + ", ".join(f"{s}={len(kept[s])}" for s in SPLITS),
         f"Unique complexes: {len(complexes)}",
+        f"Pairs: " + ", ".join(f"{s}={len(pairs_by_split[s])}" for s in SPLITS),
+        f"Distance norm: div=log1p/log1p({d_max:.1f}), "
+        f"seq=minmax[{seq_min:.4f},{seq_max:.4f}] (fit on train)",
         f"Total tokens per complex: min={min(all_lens)}, max={max(all_lens)}, "
         f"mean={np.mean(all_lens):.0f}, median={np.median(all_lens):.0f}",
     ]
@@ -296,6 +362,7 @@ def main():
     print(f"  2. Train (GPU):")
     print(f"     python train_evolution.py <config.yaml>")
     print(f"     with data_dir: {out_dir}")
+    print(f"     tune training.dist_div_weight / training.dist_seq_weight")
 
 
 if __name__ == "__main__":

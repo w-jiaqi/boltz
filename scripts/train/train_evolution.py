@@ -92,15 +92,36 @@ class CachedComplexStore:
         return [cid for cid in complex_ids if not (self.cache_dir / f"{cid}.pt").exists()]
 
 
+def combined_distance(div_norm: float, seq_norm: float,
+                      w_div: float, w_seq: float) -> float:
+    """Blend the two normalized distance components into one label.
+
+    prepare_evolution_data.py emits per-pair `div_norm` (normalized
+    phylogenetic divergence) and `seq_norm` (normalized 1 - sequence
+    identity of the swapped chain), both in [0, 1]. The weights are the
+    tunable hyperparameters (config: training.dist_div_weight /
+    training.dist_seq_weight) so the label can be re-tuned without
+    regenerating the dataset.
+    """
+    return w_div * div_norm + w_seq * seq_norm
+
+
 class PairedEvolutionDataset(Dataset):
     """Dataset of Bradley-Terry comparison pairs.
 
     Each item yields one (preferred, dispreferred) pair loaded from
-    the shared CachedComplexStore, plus evolutionary distances.
+    the shared CachedComplexStore, plus evolutionary distances. The
+    dispreferred distance is a weighted blend of the precomputed
+    `div_norm` / `seq_norm` components; the preferred (native) anchor
+    always has distance 0.
     """
 
-    def __init__(self, store: CachedComplexStore, pairs_csv: str, strict: bool = False):
+    def __init__(self, store: CachedComplexStore, pairs_csv: str,
+                 dist_div_weight: float = 0.5, dist_seq_weight: float = 0.5,
+                 strict: bool = False):
         self.store = store
+        self.w_div = dist_div_weight
+        self.w_seq = dist_seq_weight
         raw_pairs = []
         with open(pairs_csv) as f:
             for row in csv.DictReader(f):
@@ -146,11 +167,15 @@ class PairedEvolutionDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.pairs[idx]
+        dist_dispreferred = combined_distance(
+            float(row["div_norm"]), float(row["seq_norm"]),
+            self.w_div, self.w_seq,
+        )
         return {
             "preferred": self.store.get(row["preferred"]),
             "dispreferred": self.store.get(row["dispreferred"]),
-            "dist_preferred": float(row["dist_preferred"]),
-            "dist_dispreferred": float(row["dist_dispreferred"]),
+            "dist_preferred": 0.0,  # native anchor
+            "dist_dispreferred": dist_dispreferred,
         }
 
 
@@ -352,7 +377,14 @@ def train(raw_config_path: str, args: list[str]) -> None:
         max_in_memory=cfg.max_cached_in_memory,
     )
 
-    train_ds = PairedEvolutionDataset(store, str(train_csv))
+    # Distance-label weights (tunable; the dataset blends the precomputed
+    # div_norm / seq_norm components with these).
+    w_div = cfg.training.get("dist_div_weight", 0.5)
+    w_seq = cfg.training.get("dist_seq_weight", 0.5)
+
+    train_ds = PairedEvolutionDataset(
+        store, str(train_csv), dist_div_weight=w_div, dist_seq_weight=w_seq,
+    )
     train_loader = DataLoader(
         train_ds, batch_size=1, shuffle=True,
         num_workers=num_workers, collate_fn=_collate_fn, pin_memory=True,
@@ -360,7 +392,9 @@ def train(raw_config_path: str, args: list[str]) -> None:
 
     val_loader = None
     if val_csv.exists():
-        val_ds = PairedEvolutionDataset(store, str(val_csv))
+        val_ds = PairedEvolutionDataset(
+            store, str(val_csv), dist_div_weight=w_div, dist_seq_weight=w_seq,
+        )
         val_loader = DataLoader(
             val_ds, batch_size=1, shuffle=False,
             num_workers=num_workers, collate_fn=_collate_fn, pin_memory=True,
@@ -370,6 +404,7 @@ def train(raw_config_path: str, args: list[str]) -> None:
     print(f"Cache dir:       {cache_dir}")
     print(f"Train pairs:     {len(train_ds)}")
     print(f"Val pairs:       {len(val_ds) if val_loader else 0}")
+    print(f"Dist weights:    div={w_div}  seq={w_seq}")
     print(f"Cached in memory: up to {cfg.max_cached_in_memory}")
 
     # ---------- Model ----------
