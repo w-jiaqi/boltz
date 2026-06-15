@@ -168,6 +168,33 @@ def listwise_kl_loss(
     return F.kl_div(log_p, q, reduction="sum")
 
 
+def energy_magnitude_loss(
+    energy_preferred: Tensor,
+    energy_dispreferred: Tensor,
+) -> Tensor:
+    """Mean-squared anchor on the predicted energies.
+
+    L = mean[ E_preferred^2 + E_dispreferred^2 ] / 2
+
+    Both Bradley-Terry and margin losses are *scale-unbounded*: they are
+    driven toward zero by making the energy gap arbitrarily large, which
+    pushes the raw energy magnitudes to +/- infinity. On the training set
+    that is fine (the ordering is memorized), but on held-out pairs whose
+    ordering does not generalize, the convex ``softplus`` then evaluates
+    confidently-wrong predictions of ever-growing magnitude, so val loss
+    *climbs without bound* instead of plateauing at chance (~log 2).
+
+    This term anchors the energies near 0, giving the optimizer a finite
+    equilibrium: it still orders pairs correctly, but with bounded
+    confidence. The practical effect is that val loss stabilizes instead
+    of diverging, and the model is less able to memorize per-complex
+    offsets. Disabled by default (weight 0) for backward compatibility.
+    """
+    e_pref = energy_preferred.flatten()
+    e_dispref = energy_dispreferred.flatten()
+    return 0.5 * torch.mean(e_pref.pow(2) + e_dispref.pow(2))
+
+
 def evolution_loss(
     energies_preferred: Tensor,
     energies_dispreferred: Tensor,
@@ -177,11 +204,12 @@ def evolution_loss(
     margin_weight: float = 0.0,
     bt_temperature: float = 1.0,
     margin_alpha: float = 1.0,
+    energy_reg_weight: float = 0.0,
 ) -> dict:
     """Combined evolution loss.
 
-    Convenience wrapper that computes a weighted sum of Bradley-Terry
-    and margin ranking losses.
+    Convenience wrapper that computes a weighted sum of Bradley-Terry,
+    margin ranking, and energy-magnitude-regularization losses.
 
     Parameters
     ----------
@@ -203,12 +231,16 @@ def evolution_loss(
         Temperature for BT comparison.
     margin_alpha : float
         Margin scaling factor for distance-proportional gaps.
+    energy_reg_weight : float
+        Weight for the energy-magnitude anchor (see ``energy_magnitude_loss``).
+        Keeps raw energies bounded so held-out loss cannot diverge as the
+        model grows overconfident. 0 disables it.
 
     Returns
     -------
     dict
         'loss': total scalar loss
-        'loss_breakdown': dict with 'bt_loss' and 'margin_loss'
+        'loss_breakdown': dict with 'bt_loss', 'margin_loss', 'energy_reg'
     """
     bt_loss = bradley_terry_loss(
         energies_preferred, energies_dispreferred, bt_temperature
@@ -224,12 +256,19 @@ def evolution_loss(
             margin_alpha,
         )
 
-    total = bt_weight * bt_loss + margin_weight * m_loss
+    energy_reg = torch.tensor(0.0, device=energies_preferred.device)
+    if energy_reg_weight > 0:
+        energy_reg = energy_magnitude_loss(
+            energies_preferred, energies_dispreferred
+        )
+
+    total = bt_weight * bt_loss + margin_weight * m_loss + energy_reg_weight * energy_reg
 
     return {
         "loss": total,
         "loss_breakdown": {
             "bt_loss": bt_loss,
             "margin_loss": m_loss,
+            "energy_reg": energy_reg,
         },
     }

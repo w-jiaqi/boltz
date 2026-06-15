@@ -32,6 +32,7 @@ evolution_model_args:
   num_dist_bins: 64
   max_dist: 22
   use_interface_mask: false               # false=all pairs, true=interface only
+  head_dropout: 0.1                        # dropout in the energy-head MLPs (anti-memorization)
 
 # ----- Training -----
 training:
@@ -39,11 +40,19 @@ training:
   adam_beta_1: 0.9
   adam_beta_2: 0.95
   adam_eps: 1.0e-8
-  weight_decay: 0.0
+  weight_decay: 1.0e-2                     # >0 regularizes; 0.0 overfit instantly
   bt_weight: 1.0                          # Bradley-Terry loss weight
   margin_weight: 0.5                      # Margin ranking loss weight (0 to disable)
   bt_temperature: 1.0
   margin_alpha: 1.0
+  # Energy-magnitude anchor. BT/margin are scale-unbounded and drive raw
+  # energies to +/-inf, which makes held-out loss diverge upward as the
+  # model grows overconfident. This keeps energies bounded; 0 disables it.
+  energy_reg_weight: 0.1
+  # Early stopping (only used when a val set is present).
+  early_stopping: true
+  early_stopping_patience: 10
+  early_stopping_min_delta: 0.0
   lr_scheduler: linear_warmup_cosine
   lr_warmup_steps: 1000
   lr_cosine_T_max: 50000

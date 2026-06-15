@@ -34,6 +34,7 @@ from typing import Optional
 import omegaconf
 import pytorch_lightning as pl
 import torch
+from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 from pytorch_lightning.strategies import DDPStrategy
@@ -249,6 +250,7 @@ class EvolutionTrainingModule(pl.LightningModule):
             margin_weight=self.training_args.get("margin_weight", 0.0),
             bt_temperature=self.training_args.get("bt_temperature", 1.0),
             margin_alpha=self.training_args.get("margin_alpha", 1.0),
+            energy_reg_weight=self.training_args.get("energy_reg_weight", 0.0),
         ), out_pref, out_dispref
 
     def training_step(self, batch, batch_idx):
@@ -257,11 +259,15 @@ class EvolutionTrainingModule(pl.LightningModule):
         self.log("train/loss", loss_dict["loss"], prog_bar=True)
         self.log("train/bt_loss", loss_dict["loss_breakdown"]["bt_loss"])
         self.log("train/margin_loss", loss_dict["loss_breakdown"]["margin_loss"])
+        self.log("train/energy_reg", loss_dict["loss_breakdown"]["energy_reg"])
 
         e_pref = out_pref["evo_energy"].detach().mean()
         e_dispref = out_dispref["evo_energy"].detach().mean()
         self.log("train/energy_gap", e_dispref - e_pref)
         self.log("train/accuracy", (e_pref < e_dispref).float())
+        # RMS energy magnitude: if this grows without bound while val/loss
+        # climbs, the model is memorizing via overconfident energies.
+        self._log_energy_rms("train", out_pref, out_dispref)
 
         return loss_dict["loss"]
 
@@ -270,13 +276,23 @@ class EvolutionTrainingModule(pl.LightningModule):
 
         self.log("val/loss", loss_dict["loss"], prog_bar=True, sync_dist=True)
         self.log("val/bt_loss", loss_dict["loss_breakdown"]["bt_loss"], sync_dist=True)
+        self.log("val/energy_reg", loss_dict["loss_breakdown"]["energy_reg"], sync_dist=True)
 
         e_pref = out_pref["evo_energy"].detach().mean()
         e_dispref = out_dispref["evo_energy"].detach().mean()
         self.log("val/energy_gap", e_dispref - e_pref, sync_dist=True)
         self.log("val/accuracy", (e_pref < e_dispref).float(), sync_dist=True)
+        self._log_energy_rms("val", out_pref, out_dispref, sync_dist=True)
 
         return loss_dict["loss"]
+
+    def _log_energy_rms(self, stage, out_pref, out_dispref, sync_dist=False):
+        """Log RMS of the raw energies — a direct readout of overconfidence."""
+        e = torch.cat([
+            out_pref["evo_energy"].detach().flatten(),
+            out_dispref["evo_energy"].detach().flatten(),
+        ])
+        self.log(f"{stage}/energy_rms", e.pow(2).mean().sqrt(), sync_dist=sync_dist)
 
     def configure_optimizers(self):
         lr = self.training_args.get("lr", 1.8e-3)
@@ -420,13 +436,28 @@ def train(raw_config_path: str, args: list[str]) -> None:
         model.load_state_dict(state, strict=False)
 
     # ---------- Callbacks ----------
+    monitor_metric = "val/loss" if val_loader else "train/loss"
     mc = ModelCheckpoint(
         dirpath=os.path.join(cfg.output, "checkpoints"),
         filename="evolution-{epoch:03d}-{step}",
-        monitor="val/loss" if val_loader else "train/loss",
+        monitor=monitor_metric,
         save_top_k=cfg.save_top_k, save_last=True, mode="min",
         every_n_epochs=1,
     )
+    callbacks = [mc]
+
+    # Early stopping: this head overfits within ~1 epoch (train loss -> 0,
+    # val/loss diverges upward). Stop once the monitored metric stops
+    # improving so the run doesn't waste epochs past the optimum. Only
+    # meaningful when validating against val/loss.
+    if val_loader and cfg.training.get("early_stopping", True):
+        callbacks.append(EarlyStopping(
+            monitor=monitor_metric,
+            mode="min",
+            patience=int(cfg.training.get("early_stopping_patience", 10)),
+            min_delta=float(cfg.training.get("early_stopping_min_delta", 0.0)),
+            verbose=True,
+        ))
 
     # ---------- Logger ----------
     loggers = []
@@ -464,7 +495,7 @@ def train(raw_config_path: str, args: list[str]) -> None:
     trainer = pl.Trainer(
         default_root_dir=cfg.output,
         devices=devices, strategy=strategy,
-        callbacks=[mc], logger=loggers,
+        callbacks=callbacks, logger=loggers,
         enable_checkpointing=True,
         **trainer_kwargs,
     )

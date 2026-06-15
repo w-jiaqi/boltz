@@ -53,6 +53,7 @@ class EvolutionModule(nn.Module):
         num_dist_bins=64,
         max_dist=22,
         use_interface_mask: bool = False,
+        head_dropout: float = 0.0,
         groups: dict = {},
     ):
         super().__init__()
@@ -79,6 +80,7 @@ class EvolutionModule(nn.Module):
         self.evolution_heads = EvolutionHeads(
             token_z=token_z,
             hidden_dim=head_hidden_dim,
+            dropout=head_dropout,
         )
 
     def forward(
@@ -206,23 +208,31 @@ class EvolutionHeads(nn.Module):
         Pair representation dimension.
     hidden_dim : int
         Hidden dimension for the MLP.
+    dropout : float
+        Dropout probability applied inside the MLP heads. Regularizes the
+        head against memorizing per-complex energies (the main failure mode
+        observed: train loss -> 0 while val/loss diverges). 0 disables it.
     """
 
-    def __init__(self, token_z, hidden_dim):
+    def __init__(self, token_z, hidden_dim, dropout: float = 0.0):
         super().__init__()
 
         self.pool_mlp = nn.Sequential(
             nn.Linear(token_z, token_z),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(token_z, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout),
         )
 
         self.to_evo_energy = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
         # Energies start at exactly 0 → BT loss starts at log(2), margin loss
