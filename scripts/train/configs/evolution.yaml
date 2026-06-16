@@ -31,8 +31,11 @@ evolution_model_args:
   head_hidden_dim: 384
   num_dist_bins: 64
   max_dist: 22
-  use_interface_mask: false               # false=all pairs, true=interface only
+  use_interface_mask: false               # false=all pairs, true=interface only (affinity-style)
   head_dropout: 0.1                        # dropout in the energy-head MLPs (anti-memorization)
+  # --- interface-head experiment (needs a cache built with asym_id) ---
+  use_s_inputs: false                      # drop per-chain single-rep injection (memorization handle)
+  interface_pool_asym: true                # pairformer + pooling over cross-chain A<->B pairs only
 
 # ----- Training -----
 training:

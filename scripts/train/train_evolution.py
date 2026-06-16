@@ -54,6 +54,7 @@ CACHED_FEAT_KEYS = [
     "token_to_rep_atom",
     "mol_type",
     "affinity_token_mask",
+    "asym_id",  # per-token chain index; enables interface-only pooling
 ]
 
 

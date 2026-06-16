@@ -54,18 +54,31 @@ class EvolutionModule(nn.Module):
         max_dist=22,
         use_interface_mask: bool = False,
         head_dropout: float = 0.0,
+        use_s_inputs: bool = True,
+        interface_pool_asym: bool = False,
         groups: dict = {},
     ):
         super().__init__()
         self.use_interface_mask = use_interface_mask
+        # use_s_inputs: inject the per-chain single rep into z. For native-vs-swap
+        # the two chains are near-identical orthologs, so s_inputs barely differs
+        # and acts mainly as a per-complex memorization handle (probe val < chance).
+        # Disable it to force the head onto the cross-chain (coevolution) signal.
+        self.use_s_inputs = use_s_inputs
+        # interface_pool_asym: restrict the pairformer mask AND the pooling to
+        # cross-chain (A<->B) token pairs, identified by asym_id. That is where the
+        # native-vs-swap signal must live; global pooling dilutes it. Requires
+        # feats["asym_id"] (cached by cache_evolution_features.py).
+        self.interface_pool_asym = interface_pool_asym
 
         boundaries = torch.linspace(2, max_dist, num_dist_bins - 1)
         self.register_buffer("boundaries", boundaries)
         self.dist_bin_pairwise_embed = nn.Embedding(num_dist_bins, token_z)
         init.gating_init_(self.dist_bin_pairwise_embed.weight)
 
-        self.s_to_z_prod_in1 = LinearNoBias(token_s, token_z)
-        self.s_to_z_prod_in2 = LinearNoBias(token_s, token_z)
+        if use_s_inputs:
+            self.s_to_z_prod_in1 = LinearNoBias(token_s, token_z)
+            self.s_to_z_prod_in2 = LinearNoBias(token_s, token_z)
 
         self.z_norm = nn.LayerNorm(token_z)
         self.z_linear = LinearNoBias(token_z, token_z)
@@ -81,6 +94,7 @@ class EvolutionModule(nn.Module):
             token_z=token_z,
             hidden_dim=head_hidden_dim,
             dropout=head_dropout,
+            interface_pool_asym=interface_pool_asym,
         )
 
     def forward(
@@ -124,12 +138,13 @@ class EvolutionModule(nn.Module):
         z = self.z_linear(self.z_norm(z))
         z = z.repeat_interleave(multiplicity, 0)
 
-        # --- Step 2: Inject single rep via outer-sum conditioning ---
-        z = (
-            z
-            + self.s_to_z_prod_in1(s_inputs)[:, :, None, :]
-            + self.s_to_z_prod_in2(s_inputs)[:, None, :, :]
-        )
+        # --- Step 2: Inject single rep via outer-sum conditioning (optional) ---
+        if self.use_s_inputs:
+            z = (
+                z
+                + self.s_to_z_prod_in1(s_inputs)[:, :, None, :]
+                + self.s_to_z_prod_in2(s_inputs)[:, None, :, :]
+            )
 
         # --- Step 3: Compute distogram from predicted coordinates ---
         token_to_rep_atom = feats["token_to_rep_atom"]
@@ -153,7 +168,12 @@ class EvolutionModule(nn.Module):
         # --- Step 5: Build pair mask ---
         pad_token_mask = feats["token_pad_mask"].repeat_interleave(multiplicity, 0)
 
-        if use_interface_mask:
+        if self.interface_pool_asym and "asym_id" in feats:
+            # Cross-chain (A<->B) pairs only, identified by differing asym_id.
+            asym = feats["asym_id"].repeat_interleave(multiplicity, 0)
+            cross = (asym[:, :, None] != asym[:, None, :]).to(z.dtype)
+            pair_mask = cross * pad_token_mask[:, :, None] * pad_token_mask[:, None, :]
+        elif use_interface_mask:
             # Cross-interface masking (same as affinity head):
             # only ligand-receptor, receptor-ligand, and ligand-ligand pairs
             rec_mask = (feats["mol_type"] == 0).repeat_interleave(multiplicity, 0)
@@ -214,8 +234,10 @@ class EvolutionHeads(nn.Module):
         observed: train loss -> 0 while val/loss diverges). 0 disables it.
     """
 
-    def __init__(self, token_z, hidden_dim, dropout: float = 0.0):
+    def __init__(self, token_z, hidden_dim, dropout: float = 0.0,
+                 interface_pool_asym: bool = False):
         super().__init__()
+        self.interface_pool_asym = interface_pool_asym
 
         self.pool_mlp = nn.Sequential(
             nn.Linear(token_z, token_z),
@@ -248,7 +270,19 @@ class EvolutionHeads(nn.Module):
             .unsqueeze(-1)
         )
 
-        if use_interface_mask:
+        if self.interface_pool_asym and "asym_id" in feats:
+            # Cross-chain (A<->B) pooling via asym_id. Diagonal is excluded
+            # automatically (same token -> same asym_id).
+            asym = (
+                feats["asym_id"].repeat_interleave(multiplicity, 0).unsqueeze(-1)
+            )
+            cross = (asym[:, :, None] != asym[:, None, :]).to(pad_token_mask.dtype)
+            pool_mask = (
+                cross
+                * pad_token_mask[:, :, None]
+                * pad_token_mask[:, None, :]
+            )
+        elif use_interface_mask:
             # Cross-interface pooling (same regions as affinity head)
             rec_mask = (
                 (feats["mol_type"] == 0)

@@ -42,7 +42,9 @@ from boltz.main import (
 from boltz.model.models.boltz2 import Boltz2
 
 
-FEAT_KEYS = ["token_pad_mask", "token_to_rep_atom", "mol_type", "affinity_token_mask"]
+# asym_id (per-token chain index) is needed for interface-only pooling in the
+# evolution head (cross-chain A<->B pairs). Added so a fresh cache supports it.
+FEAT_KEYS = ["token_pad_mask", "token_to_rep_atom", "mol_type", "affinity_token_mask", "asym_id"]
 
 
 class EvolutionCacheWriter(BasePredictionWriter):
