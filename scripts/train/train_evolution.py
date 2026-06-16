@@ -55,6 +55,7 @@ CACHED_FEAT_KEYS = [
     "mol_type",
     "affinity_token_mask",
     "asym_id",  # per-token chain index; enables interface-only pooling
+    "iface_dist",  # [N,N] residue-residue min heavy-atom distance (contact map)
 ]
 
 

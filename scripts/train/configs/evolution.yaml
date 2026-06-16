@@ -33,9 +33,12 @@ evolution_model_args:
   max_dist: 22
   use_interface_mask: false               # false=all pairs, true=interface only (affinity-style)
   head_dropout: 0.1                        # dropout in the energy-head MLPs (anti-memorization)
-  # --- interface-head experiment (needs a cache built with asym_id) ---
+  # --- interface-head experiment (needs a cache built with asym_id + iface_dist) ---
   use_s_inputs: false                      # drop per-chain single-rep injection (memorization handle)
-  interface_pool_asym: true                # pairformer + pooling over cross-chain A<->B pairs only
+  interface_pool_asym: false               # coarse: pool all cross-chain A<->B pairs
+  interface_pool_contact: true             # proper: pool the contact map (cross-chain residues in contact)
+  contact_cutoff: 8.0                      # Angstrom; min heavy-atom dist (CAPRI~5, coevolution~8)
+  contact_sharpness: 1.0                   # softness of the sigmoid contact indicator
 
 # ----- Training -----
 training:

@@ -47,6 +47,41 @@ from boltz.model.models.boltz2 import Boltz2
 FEAT_KEYS = ["token_pad_mask", "token_to_rep_atom", "mol_type", "affinity_token_mask", "asym_id"]
 
 
+def compute_contact_map(x_pred, atom_to_token, ref_element, atom_pad_mask, big=1.0e4):
+    """Residue-residue MINIMUM heavy-atom distance (Angstrom) -> [N_tok, N_tok].
+
+    The cross-chain entries of this matrix are the protein-protein contact map:
+    residues i, j are in contact when their closest heavy atoms are within a
+    cutoff (CAPRI uses 5 A; the coevolution literature often 8 A). We cache the
+    raw distance (not a thresholded mask) so the contact cutoff stays tunable
+    at train time without re-caching. Hydrogens (atomic number 1) and padding
+    atoms are excluded; empty residue pairs get `big`.
+
+    atom_to_token : [N_atom, N_tok] one-hot
+    ref_element   : [N_atom, num_elements] one-hot of atomic number
+    atom_pad_mask : [N_atom]
+    """
+    dev = x_pred.device
+    a2t = atom_to_token.to(dev)
+    n_atom, n_tok = a2t.shape
+    tok = a2t.argmax(-1)                                   # token index per atom
+    elem = ref_element.to(dev).argmax(-1)                 # atomic number per atom
+    heavy = (elem > 1) & atom_pad_mask.to(dev).bool()     # drop H(=1) + padding(=0)
+    if int(heavy.sum()) < 2:
+        return x_pred.new_full((n_tok, n_tok), big)
+    coords = x_pred[heavy].float()                         # [nh, 3]
+    tokh = tok[heavy]                                      # [nh]
+    nh = coords.shape[0]
+    d = torch.cdist(coords, coords)                        # [nh, nh]
+    # min over target atoms grouped by their token -> [nh, n_tok]
+    t1 = coords.new_full((nh, n_tok), big)
+    t1.scatter_reduce_(1, tokh.view(1, nh).expand(nh, nh), d, reduce="amin", include_self=True)
+    # min over source atoms grouped by their token -> [n_tok, n_tok]
+    m = coords.new_full((n_tok, n_tok), big)
+    m.scatter_reduce_(0, tokh.view(nh, 1).expand(nh, n_tok), t1, reduce="amin", include_self=True)
+    return m
+
+
 class EvolutionCacheWriter(BasePredictionWriter):
     """Saves trunk representations to .pt files during prediction."""
 
@@ -108,6 +143,19 @@ class EvolutionCacheWriter(BasePredictionWriter):
                 if val.is_floating_point() and self.save_half:
                     val = val.half()
                 cache[key] = val
+
+        # Interface contact map: residue-residue min heavy-atom distance, on the
+        # SAME predicted coords used for x_pred. Cross-chain entries are the PPI
+        # contact map the evolution head pools over. Stored raw (Angstrom) so the
+        # contact cutoff is tunable without re-caching.
+        if all(k in batch for k in ("atom_to_token", "ref_element", "atom_pad_mask")):
+            cmap = compute_contact_map(
+                x_pred.to(device),
+                batch["atom_to_token"][0],
+                batch["ref_element"][0],
+                batch["atom_pad_mask"][0],
+            )
+            cache["iface_dist"] = maybe_half(cmap.cpu())
 
         torch.save(cache, out_path)
         print(f"  Cached {record_id} -> {out_path}")

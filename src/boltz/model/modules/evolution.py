@@ -56,6 +56,9 @@ class EvolutionModule(nn.Module):
         head_dropout: float = 0.0,
         use_s_inputs: bool = True,
         interface_pool_asym: bool = False,
+        interface_pool_contact: bool = False,
+        contact_cutoff: float = 8.0,
+        contact_sharpness: float = 1.0,
         groups: dict = {},
     ):
         super().__init__()
@@ -70,6 +73,14 @@ class EvolutionModule(nn.Module):
         # native-vs-swap signal must live; global pooling dilutes it. Requires
         # feats["asym_id"] (cached by cache_evolution_features.py).
         self.interface_pool_asym = interface_pool_asym
+        # interface_pool_contact: the proper interface -- pool over the actual
+        # protein-protein CONTACT MAP (cross-chain residue pairs whose closest
+        # heavy atoms are within contact_cutoff A), softened by a sigmoid so the
+        # cutoff is differentiable and not brittle. Requires feats["iface_dist"]
+        # (residue-residue min heavy-atom distance, cached at feature time).
+        self.interface_pool_contact = interface_pool_contact
+        self.contact_cutoff = contact_cutoff
+        self.contact_sharpness = contact_sharpness
 
         boundaries = torch.linspace(2, max_dist, num_dist_bins - 1)
         self.register_buffer("boundaries", boundaries)
@@ -95,6 +106,9 @@ class EvolutionModule(nn.Module):
             hidden_dim=head_hidden_dim,
             dropout=head_dropout,
             interface_pool_asym=interface_pool_asym,
+            interface_pool_contact=interface_pool_contact,
+            contact_cutoff=contact_cutoff,
+            contact_sharpness=contact_sharpness,
         )
 
     def forward(
@@ -168,8 +182,10 @@ class EvolutionModule(nn.Module):
         # --- Step 5: Build pair mask ---
         pad_token_mask = feats["token_pad_mask"].repeat_interleave(multiplicity, 0)
 
-        if self.interface_pool_asym and "asym_id" in feats:
-            # Cross-chain (A<->B) pairs only, identified by differing asym_id.
+        if (self.interface_pool_asym or self.interface_pool_contact) and "asym_id" in feats:
+            # Restrict the pairformer to cross-chain (A<->B) pairs. (The contact
+            # weighting is applied at pooling time, not here -- the pairformer
+            # still refines the whole cross-chain block.)
             asym = feats["asym_id"].repeat_interleave(multiplicity, 0)
             cross = (asym[:, :, None] != asym[:, None, :]).to(z.dtype)
             pair_mask = cross * pad_token_mask[:, :, None] * pad_token_mask[:, None, :]
@@ -235,9 +251,14 @@ class EvolutionHeads(nn.Module):
     """
 
     def __init__(self, token_z, hidden_dim, dropout: float = 0.0,
-                 interface_pool_asym: bool = False):
+                 interface_pool_asym: bool = False,
+                 interface_pool_contact: bool = False,
+                 contact_cutoff: float = 8.0, contact_sharpness: float = 1.0):
         super().__init__()
         self.interface_pool_asym = interface_pool_asym
+        self.interface_pool_contact = interface_pool_contact
+        self.contact_cutoff = contact_cutoff
+        self.contact_sharpness = contact_sharpness
 
         self.pool_mlp = nn.Sequential(
             nn.Linear(token_z, token_z),
@@ -270,7 +291,25 @@ class EvolutionHeads(nn.Module):
             .unsqueeze(-1)
         )
 
-        if self.interface_pool_asym and "asym_id" in feats:
+        if self.interface_pool_contact and "iface_dist" in feats and "asym_id" in feats:
+            # Pool over the protein-protein CONTACT MAP: cross-chain residue
+            # pairs weighted by a soft contact indicator on the min heavy-atom
+            # distance. w = sigmoid((cutoff - dist) / sharpness) in [0, 1].
+            asym = (
+                feats["asym_id"].repeat_interleave(multiplicity, 0).unsqueeze(-1)
+            )
+            cross = (asym[:, :, None] != asym[:, None, :]).to(pad_token_mask.dtype)
+            dist = feats["iface_dist"].repeat_interleave(multiplicity, 0).unsqueeze(-1)
+            contact = torch.sigmoid(
+                (self.contact_cutoff - dist) / max(self.contact_sharpness, 1e-3)
+            )
+            pool_mask = (
+                contact
+                * cross
+                * pad_token_mask[:, :, None]
+                * pad_token_mask[:, None, :]
+            )
+        elif self.interface_pool_asym and "asym_id" in feats:
             # Cross-chain (A<->B) pooling via asym_id. Diagonal is excluded
             # automatically (same token -> same asym_id).
             asym = (
