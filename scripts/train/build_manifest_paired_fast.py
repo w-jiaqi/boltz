@@ -31,10 +31,16 @@ Usage:
 """
 import argparse
 import json
+import re
 from pathlib import Path
 
 MAX_PAIRED_SEQS = 8192
 MAX_MSA_SEQS = 16384
+
+# UniRef headers carry taxonomy as "... TaxID=9606 RepID=...". We read taxid
+# from the target header (theader) rather than mmseqs `taxid`, because the local
+# uniref30 DB has no taxonomy mapping built.
+_TAXID_RE = re.compile(r"TaxID=(\d+)")
 
 
 def read_fasta(path):
@@ -68,18 +74,24 @@ def a3m_row(qaln, taln, qstart, qend, qlen):
 
 
 def parse_hits(hits_path, qlens):
-    """query seq_id -> {taxid: a3m_row} keeping the first (best) hit per taxid."""
+    """query seq_id -> {taxid: a3m_row} keeping the first (best) hit per taxid.
+
+    Expected columns (mmseqs convertalis --format-output):
+        query, target, qstart, qend, qaln, taln, theader
+    taxid is parsed from theader (TaxID=...).
+    """
     by_chain = {}
     with open(hits_path) as f:
         for line in f:
             p = line.rstrip("\n").split("\t")
             if len(p) < 7:
                 continue
-            q, t, tax, qs, qe, qa, ta = p[0], p[1], p[2], p[3], p[4], p[5], p[6]
-            try:
-                tax = int(tax)
-            except ValueError:
+            q, t, qs, qe, qa, ta = p[0], p[1], p[2], p[3], p[4], p[5]
+            header = "\t".join(p[6:])  # theader (rejoin defensively)
+            m = _TAXID_RE.search(header)
+            if not m:
                 continue
+            tax = int(m.group(1))
             if tax <= 0:
                 continue
             qlen = qlens.get(q)
