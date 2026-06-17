@@ -27,8 +27,10 @@ def parse_csv(
         The MSA object.
 
     """
-    # Read file
-    data = pd.read_csv(path)
+    # Read file. keep_default_na=False so sequences like "NA"/"NULL" (and empty
+    # cells) stay strings instead of becoming float NaN, which would crash the
+    # downstream `.strip()`.
+    data = pd.read_csv(path, keep_default_na=False)
 
     # Check columns
     if tuple(sorted(data.columns)) != ("key", "sequence"):

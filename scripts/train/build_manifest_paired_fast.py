@@ -114,9 +114,15 @@ def unpaired_rows(a3m_path, limit):
 
 
 def write_entity_csv(path, paired, unpaired):
+    # Strip NUL bytes / surrounding whitespace: a stray '\0' in a sequence makes
+    # pandas read the cell as NaN downstream (-> 'float has no strip' crash that
+    # silently drops the complex). Drop any row that is empty after cleaning.
+    def clean(s):
+        return s.replace("\x00", "").strip()
     keys = list(range(len(paired))) + [-1] * len(unpaired)
-    seqs = paired + unpaired
-    path.write_text("\n".join(["key,sequence"] + [f"{k},{s}" for k, s in zip(keys, seqs)]) + "\n")
+    seqs = [clean(s) for s in (paired + unpaired)]
+    rows = [(k, s) for k, s in zip(keys, seqs) if s]
+    path.write_text("\n".join(["key,sequence"] + [f"{k},{s}" for k, s in rows]) + "\n")
 
 
 def cmd_pair(args):
