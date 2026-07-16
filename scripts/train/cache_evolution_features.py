@@ -46,14 +46,26 @@ FEAT_KEYS = ["token_pad_mask", "token_to_rep_atom", "mol_type", "affinity_token_
 
 
 class EvolutionCacheWriter(BasePredictionWriter):
-    """Saves trunk representations to .pt files during prediction."""
+    """Saves trunk representations to .pt files during prediction.
 
-    def __init__(self, output_dir: str, save_half: bool = True, skip_diffusion: bool = False):
+    Normally saves the trunk's FINAL pair rep ``z`` (output of the last
+    pairformer layer). When ``split_capture`` is provided, saves instead the
+    pair rep at the INPUT to trunk layer ``split_capture.split_layer`` — the
+    representation a TrunkTailModule needs so the tail layers can be re-run and
+    fine-tuned at head-training time. ``split_capture`` is a mutable dict written
+    by a forward-pre-hook (see ``register_split_hook``); its ``"z"`` entry is the
+    most recent capture, which — with batch_size=1 and the trunk running once per
+    record — is exactly this record's pre-split z.
+    """
+
+    def __init__(self, output_dir: str, save_half: bool = True, skip_diffusion: bool = False,
+                 split_capture: dict = None):
         super().__init__(write_interval="batch")
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.save_half = save_half
         self.skip_diffusion = skip_diffusion
+        self.split_capture = split_capture
 
     def write_on_batch_end(
         self, trainer, pl_module, prediction, batch_indices, batch, batch_idx, dataloader_idx
@@ -94,11 +106,24 @@ class EvolutionCacheWriter(BasePredictionWriter):
             }
             s_inputs = pl_module.input_embedder(batch_device)
 
+        if self.split_capture is not None:
+            captured = self.split_capture.get("z", None)
+            if captured is None:
+                raise RuntimeError(
+                    f"split_layer capture is empty for {record_id}: the forward "
+                    f"pre-hook on the trunk layer never fired. Did the trunk run?"
+                )
+            z_to_save = captured[0]
+        else:
+            z_to_save = prediction["z"][0]
+
         cache = {
             "s_inputs": maybe_half(s_inputs[0].cpu()),
-            "z": maybe_half(prediction["z"][0].cpu()),
+            "z": maybe_half(z_to_save.cpu()),
             "x_pred": maybe_half(x_pred.cpu()),
         }
+        if self.split_capture is not None:
+            cache["split_layer"] = int(self.split_capture["split_layer"])
 
         for key in FEAT_KEYS:
             if key in batch:
@@ -141,6 +166,13 @@ def main():
                         help="Only cache the first N records from the manifest. "
                         "Useful for sanity checks without rebuilding the manifest. "
                         "Default: cache everything in the manifest.")
+    parser.add_argument("--split_layer", type=int, default=None,
+                        help="For trunk-tail fine-tuning: instead of the final trunk "
+                        "pair rep, cache the pair rep at the INPUT to trunk pairformer "
+                        "layer SPLIT_LAYER (0-indexed). A TrunkTailModule then re-runs "
+                        "layers [SPLIT_LAYER, num_blocks) at train time. Boltz-2 has 64 "
+                        "blocks, so e.g. 60 keeps the last 4 layers replayable. Default: "
+                        "None (cache final z, original behavior).")
     args = parser.parse_args()
 
     out_dir = Path(args.output)
@@ -235,6 +267,27 @@ def main():
     model = Boltz2.load_from_checkpoint(str(checkpoint), **load_kwargs)
     model.eval()
 
+    # Trunk-tail split capture: hook the input z of trunk layer `split_layer`.
+    split_capture = None
+    if args.split_layer is not None:
+        pf = model.pairformer_module
+        pf = getattr(pf, "_orig_mod", pf)  # unwrap torch.compile if present
+        n_blocks = len(pf.layers)
+        if not 0 < args.split_layer < n_blocks:
+            print(f"ERROR: --split_layer must be in (0, {n_blocks}); got {args.split_layer}")
+            sys.exit(1)
+        split_capture = {"split_layer": args.split_layer, "z": None}
+
+        def _pre_hook(module, inputs):
+            # PairformerLayer.forward(s, z, mask, pair_mask, ...) -> inputs[1] is z.
+            # Keep only the latest; with batch_size=1 and the trunk running once
+            # per record, the value present at write time is this record's pre-split z.
+            split_capture["z"] = inputs[1].detach()
+
+        pf.layers[args.split_layer].register_forward_pre_hook(_pre_hook)
+        print(f"Trunk-tail caching: saving z at INPUT to layer {args.split_layer} "
+              f"of {n_blocks}; tail = layers [{args.split_layer}, {n_blocks}).")
+
     data_module = Boltz2InferenceDataModule(
         manifest=processed.manifest,
         target_dir=processed.targets_dir,
@@ -250,6 +303,7 @@ def main():
         output_dir=str(out_dir),
         save_half=not args.no_half,
         skip_diffusion=args.skip_diffusion,
+        split_capture=split_capture,
     )
 
     strategy = "auto"

@@ -296,15 +296,43 @@ class EvolutionTrainingModule(pl.LightningModule):
 
     def configure_optimizers(self):
         lr = self.training_args.get("lr", 1.8e-3)
+        weight_decay = self.training_args.get("weight_decay", 0.0)
+
+        # Split parameters into the trunk tail (pretrained, fine-tuned gently) and
+        # the head (trained from scratch). The tail gets lr * trunk_tail_lr_mult
+        # so a large head LR doesn't blow away good pretrained trunk weights.
+        # Only requires_grad params reach the optimizer, so frozen tail layers are
+        # naturally excluded.
+        tail = getattr(self.evolution_module, "trunk_tail", None)
+        if tail is not None:
+            tail_ids = {id(p) for p in tail.parameters()}
+            tail_params = [p for p in tail.parameters() if p.requires_grad]
+            head_params = [
+                p for p in self.parameters()
+                if p.requires_grad and id(p) not in tail_ids
+            ]
+            lr_mult = float(self.training_args.get("trunk_tail_lr_mult", 0.1))
+            param_groups = [
+                {"params": head_params, "lr": lr},
+                {"params": tail_params, "lr": lr * lr_mult},
+            ]
+            n_tail = sum(p.numel() for p in tail_params)
+            n_head = sum(p.numel() for p in head_params)
+            print(f"Optimizer param groups: head={n_head:,} @ lr={lr:.2e}, "
+                  f"trunk_tail={n_tail:,} @ lr={lr * lr_mult:.2e}")
+        else:
+            param_groups = [{"params": [p for p in self.parameters() if p.requires_grad],
+                             "lr": lr}]
+
         optimizer = torch.optim.AdamW(
-            self.parameters(),
+            param_groups,
             lr=lr,
             betas=(
                 self.training_args.get("adam_beta_1", 0.9),
                 self.training_args.get("adam_beta_2", 0.95),
             ),
             eps=self.training_args.get("adam_eps", 1e-8),
-            weight_decay=self.training_args.get("weight_decay", 0.0),
+            weight_decay=weight_decay,
         )
 
         sched_type = self.training_args.get("lr_scheduler", None)
@@ -355,6 +383,9 @@ class TrainEvolutionConfig:
     wandb: Optional[dict] = None
     pretrained: Optional[str] = None
     resume: Optional[str] = None
+    # Boltz-2 checkpoint to initialize the trunk tail from (required when
+    # evolution_model_args.use_trunk_tail is true). Same ckpt used for caching.
+    trunk_tail_checkpoint: Optional[str] = None
     debug: bool = False
     num_workers: int = 4
     save_top_k: int = 3
@@ -434,6 +465,21 @@ def train(raw_config_path: str, args: list[str]) -> None:
         ckpt = torch.load(cfg.pretrained, map_location="cpu", weights_only=False)
         state = ckpt.get("state_dict", ckpt)
         model.load_state_dict(state, strict=False)
+
+    # Initialize the trunk tail from the Boltz-2 checkpoint. Do this after the
+    # optional `pretrained` head load so the trunk weights are always the real
+    # pretrained ones (a head-only pretrained ckpt won't contain trunk_tail keys,
+    # so strict=False above leaves the tail untouched anyway). Skipped on resume,
+    # where the tail comes from the resumed checkpoint.
+    tail = getattr(model.evolution_module, "trunk_tail", None)
+    if tail is not None and not cfg.resume:
+        if not cfg.trunk_tail_checkpoint:
+            print("ERROR: use_trunk_tail is on but trunk_tail_checkpoint is not set.")
+            sys.exit(1)
+        n = tail.load_trunk_weights(cfg.trunk_tail_checkpoint)
+        print(f"Loaded {n} trunk z-track tensors into the tail "
+              f"(layers [{tail.split_layer}, {tail.num_blocks}), "
+              f"{tail.num_unfrozen} trainable) from {cfg.trunk_tail_checkpoint}")
 
     # ---------- Callbacks ----------
     monitor_metric = "val/loss" if val_loader else "train/loss"
