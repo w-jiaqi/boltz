@@ -1121,8 +1121,13 @@ class Boltz2(LightningModule):
             if "keys_dict_out" in self.predict_args:
                 for key in self.predict_args["keys_dict_out"]:
                     pred_dict[key] = out[key]
-            pred_dict["coords"] = out["sample_atom_coords"]
-            if self.confidence_prediction:
+            # When the structure module is skipped (skip_run_structure, e.g.
+            # trunk-only feature caching), no coordinates are produced. The trunk
+            # outputs (s, z, s_inputs) above are still valid; downstream consumers
+            # that need coords must supply them another way (e.g. --aux_from).
+            if "sample_atom_coords" in out:
+                pred_dict["coords"] = out["sample_atom_coords"]
+            if self.confidence_prediction and not self.skip_run_structure:
                 # pred_dict["confidence"] = out.get("ablation_confidence", None)
                 pred_dict["pde"] = out["pde"]
                 pred_dict["plddt"] = out["plddt"]

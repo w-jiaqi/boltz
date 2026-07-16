@@ -195,6 +195,15 @@ def main():
                         "structure module is skipped: only the trunk runs (to capture "
                         "the split-layer z), so caching is much cheaper AND the pose is "
                         "byte-identical to the baseline. Intended with --split_layer.")
+    parser.add_argument("--num_shards", type=int, default=1,
+                        help="Split the manifest into this many contiguous shards and "
+                        "cache only --shard_index. For array jobs over one big manifest "
+                        "(e.g. the odinz cache). Applied after --max_complexes.")
+    parser.add_argument("--shard_index", type=int, default=0,
+                        help="Which shard (0-indexed) of --num_shards to cache.")
+    parser.add_argument("--skip_existing", action="store_true",
+                        help="Skip records whose .pt already exists in --output. Makes "
+                        "caching resumable across requeues.")
     args = parser.parse_args()
 
     out_dir = Path(args.output)
@@ -229,6 +238,23 @@ def main():
     if args.max_complexes is not None and len(manifest.records) > args.max_complexes:
         manifest = Manifest(manifest.records[:args.max_complexes])
         print(f"Truncated manifest to first {args.max_complexes} records (debug)")
+
+    if args.num_shards > 1:
+        if not 0 <= args.shard_index < args.num_shards:
+            print(f"ERROR: --shard_index must be in [0, {args.num_shards})")
+            sys.exit(1)
+        recs = manifest.records[args.shard_index::args.num_shards]
+        manifest = Manifest(recs)
+        print(f"Shard {args.shard_index}/{args.num_shards}: {len(recs)} records")
+
+    if args.skip_existing:
+        before = len(manifest.records)
+        recs = [r for r in manifest.records if not (out_dir / f"{r.id}.pt").exists()]
+        manifest = Manifest(recs)
+        print(f"skip_existing: {before - len(recs)} already cached, {len(recs)} to do")
+        if not recs:
+            print("Nothing to cache in this shard; exiting.")
+            return
 
     processed_dir = out_dir / "processed"
     processed = BoltzProcessedInput(
