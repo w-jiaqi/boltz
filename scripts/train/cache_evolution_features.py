@@ -59,13 +59,18 @@ class EvolutionCacheWriter(BasePredictionWriter):
     """
 
     def __init__(self, output_dir: str, save_half: bool = True, skip_diffusion: bool = False,
-                 split_capture: dict = None):
+                 split_capture: dict = None, aux_from: str = None):
         super().__init__(write_interval="batch")
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.save_half = save_half
         self.skip_diffusion = skip_diffusion
         self.split_capture = split_capture
+        # If set, reuse x_pred from an existing per-record .pt in this dir instead
+        # of running diffusion. Lets trunk-tail caching skip the (stochastic,
+        # expensive) structure module while keeping the exact same predicted pose
+        # as the baseline cache — so only z changes between baseline and tail runs.
+        self.aux_from = Path(aux_from) if aux_from else None
 
     def write_on_batch_end(
         self, trainer, pl_module, prediction, batch_indices, batch, batch_idx, dataloader_idx
@@ -78,7 +83,18 @@ class EvolutionCacheWriter(BasePredictionWriter):
 
         maybe_half = lambda t: t.half() if self.save_half else t  # noqa: E731
 
-        if self.skip_diffusion:
+        if self.aux_from is not None:
+            # Reuse the predicted pose from the baseline cache; no diffusion ran.
+            aux_path = self.aux_from / f"{record_id}.pt"
+            if not aux_path.exists():
+                raise FileNotFoundError(
+                    f"--aux_from is set but {aux_path} does not exist. Every record "
+                    f"being cached must have an x_pred in the baseline cache."
+                )
+            aux = torch.load(aux_path, map_location="cpu", weights_only=False)
+            x_pred = aux["x_pred"]
+            del aux
+        elif self.skip_diffusion:
             # Use ground truth coords from the batch as x_pred
             # coords shape: [B, K, N_atoms, 3] — take first conformer
             gt_coords = batch["coords"]
@@ -173,6 +189,12 @@ def main():
                         "layers [SPLIT_LAYER, num_blocks) at train time. Boltz-2 has 64 "
                         "blocks, so e.g. 60 keeps the last 4 layers replayable. Default: "
                         "None (cache final z, original behavior).")
+    parser.add_argument("--aux_from", default=None,
+                        help="Reuse x_pred from the baseline cache at this dir (one "
+                        ".pt per record) instead of running diffusion. Implies the "
+                        "structure module is skipped: only the trunk runs (to capture "
+                        "the split-layer z), so caching is much cheaper AND the pose is "
+                        "byte-identical to the baseline. Intended with --split_layer.")
     args = parser.parse_args()
 
     out_dir = Path(args.output)
@@ -258,10 +280,12 @@ def main():
         steering_args=asdict(steering_args),
     )
 
-    if args.skip_diffusion:
+    if args.skip_diffusion or args.aux_from:
         # Tell the model to run trunk but skip structure prediction.
         # The model still produces s, z, s_inputs and the predict_step
         # still returns them. Diffusion sampling is skipped entirely.
+        # With --aux_from, x_pred comes from the baseline cache, so we never
+        # need diffusion or ground-truth coords.
         load_kwargs["skip_run_structure"] = True
 
     model = Boltz2.load_from_checkpoint(str(checkpoint), **load_kwargs)
@@ -304,6 +328,7 @@ def main():
         save_half=not args.no_half,
         skip_diffusion=args.skip_diffusion,
         split_capture=split_capture,
+        aux_from=args.aux_from,
     )
 
     strategy = "auto"
