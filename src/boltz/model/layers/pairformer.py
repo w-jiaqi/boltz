@@ -324,6 +324,13 @@ class PairformerNoSeqModule(nn.Module):
                     pair_mask,
                     chunk_size_tri_attn,
                     use_kernels,
+                    # Non-reentrant is required under DDP: the evolution head runs two
+                    # forwards (preferred + dispreferred) through these same params, and
+                    # reentrant checkpointing makes DDP mark each param ready twice
+                    # ("Expected to mark a variable ready only once"); static_graph=True
+                    # then trips expect_autograd_hooks_ INTERNAL ASSERT. use_reentrant=False
+                    # is DDP-safe and is the modern default.
+                    use_reentrant=False,
                 )
             else:
                 z = layer(
