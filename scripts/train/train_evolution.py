@@ -490,6 +490,10 @@ def train(raw_config_path: str, args: list[str]) -> None:
         (isinstance(devices, int) and devices > 1) or
         (isinstance(devices, list) and len(devices) > 1)
     ):
+        # NOTE: pairformer activation_checkpointing uses use_reentrant=False
+        # (see layers/pairformer.py), which is DDP-safe even though each step runs two
+        # forwards through the same params. Do NOT set static_graph=True here: combined
+        # with checkpointing it trips expect_autograd_hooks_ INTERNAL ASSERT in DDP.
         strategy = DDPStrategy(find_unused_parameters=False)
 
     trainer = pl.Trainer(

@@ -54,6 +54,7 @@ class EvolutionModule(nn.Module):
         max_dist=22,
         use_interface_mask: bool = False,
         head_dropout: float = 0.0,
+        zero_init_energy: bool = True,
         groups: dict = {},
     ):
         super().__init__()
@@ -81,6 +82,7 @@ class EvolutionModule(nn.Module):
             token_z=token_z,
             hidden_dim=head_hidden_dim,
             dropout=head_dropout,
+            zero_init_energy=zero_init_energy,
         )
 
     def forward(
@@ -214,7 +216,8 @@ class EvolutionHeads(nn.Module):
         observed: train loss -> 0 while val/loss diverges). 0 disables it.
     """
 
-    def __init__(self, token_z, hidden_dim, dropout: float = 0.0):
+    def __init__(self, token_z, hidden_dim, dropout: float = 0.0,
+                 zero_init_energy: bool = True):
         super().__init__()
 
         self.pool_mlp = nn.Sequential(
@@ -235,10 +238,15 @@ class EvolutionHeads(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
-        # Energies start at exactly 0 → BT loss starts at log(2), margin loss
-        # is well-behaved at step 0. Without this, default Kaiming-uniform init
-        # gives arbitrary nonzero starting energies that can flip ranking signs.
-        init.final_init_(self.to_evo_energy[-1].weight)
+        # zero_init_energy=True: energies start at exactly 0 → BT loss starts at
+        # log(2), margin loss well-behaved at step 0. But it also zeroes the
+        # gradient into the pairformer at init, so the head can stall at the
+        # log(2) plateau. zero_init_energy=False gives a small nonzero init so
+        # energies (and gradients into the trunk) are live from step 0.
+        if zero_init_energy:
+            init.final_init_(self.to_evo_energy[-1].weight)
+        else:
+            nn.init.normal_(self.to_evo_energy[-1].weight, std=0.02)
         init.bias_init_zero_(self.to_evo_energy[-1].bias)
 
     def forward(self, z, feats, multiplicity=1, use_interface_mask=False):
